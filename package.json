@@ -1,6 +1,6 @@
 {
   "name": "browser-layer",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "description": "A terminal browser for AI agents: pages as text maps, actions that answer with what changed, lists as records. Runs headless Chrome, Edge or Chromium.",
   "keywords": [
     "agent",
