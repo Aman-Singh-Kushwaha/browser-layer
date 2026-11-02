@@ -441,12 +441,22 @@ async function changes(tab: Tab, settled = ''): Promise<string> {
   if (size > snap.text.length) {
     if (snap.text.length > renderMap(snap.tree, snap.origin, caps(), policy['render.mapFew']).length) {
       // New records (the next page of a table) leave a map as it was, so what changed is answered as those
-      // records, plus any other new lines. Too many to fit one page: the map, naming where they are.
+      // records, plus any other new lines. Too many to fit one page: the map, naming where they are. A page
+      // that changed around its lists too (an app re-rendering as a menu opens) is answered with its map:
+      // what opened is listed there with its refs, and regions shown before, unchanged, are one line each.
       const changed = changedCollections(snap, added)
       const found = changed.found.filter(n => records(n, snap.origin, caps()).rows.length)
       const inside = new Set(found.flatMap(changed.lines))
-      const body = [...added.filter(l => !inside.has(l)).map(l => `+ ${l}`), ...found.map(n => recordsView(n, snap.origin, {}))].join('\n\n')
+      const outside = added.filter(l => !inside.has(l))
+      if (outside.length > policy['render.mapFew']) return mapView(tab, snap, settled)
       const where = found.map(n => `[${n.ref}] ${n.role}`).join(', ')
+      // The action opened something (a list of options, a menu, a dialog): that is the answer, and lists
+      // that changed around it are named, not given as records.
+      if (outside.some(l => / expanded\b/.test(l) || /^\[\d+\] (listbox|menu|dialog|alertdialog|grid|tree)\b/.test(l))) {
+        remember(tab, snap.text)
+        return `${await header(tab)}  — it opened what is below${where ? `; ${where} changed too (read <ref> shows it)` : ''}${settled ? `, settled: ${settled}` : ''}\n\n${outside.map(l => `+ ${l}`).join('\n')}`
+      }
+      const body = [...outside.map(l => `+ ${l}`), ...found.map(n => recordsView(n, snap.origin, {}))].join('\n\n')
       if (!found.length || body.length > policy['render.pageChars']) return mapView(tab, snap, settled, where && `new records in ${where} (browser-layer get <ref> reads them)`)
       remember(tab, snap.text)
       return `${await header(tab)}  — new records in ${where}${settled ? `, settled: ${settled}` : ''}\n\n${body}`
@@ -889,11 +899,19 @@ async function run(c: Command): Promise<string> {
         if (!/not a <select>/.test(String(err))) throw err
       }
       // A custom dropdown (an ARIA combobox or listbox): opened and its option clicked by name, as a person
-      // picks one. An option that is not there closes it again (Escape) and lists what it offers.
-      await pointerAt(tab, c.ref, {})
-      await settle(tab, policy['explore.waitMs'])
+      // picks one. One already open is not clicked shut. An option that is not there closes it again (Escape)
+      // and lists what it offers.
+      const listed = async () => {
+        const tree = (await snapshot(tab)).tree
+        return { open: findRef(tree, Number(c.ref))?.states?.includes('expanded'), options: withRefs(tree).filter(n => n.role === 'option' || n.role === 'menuitemradio' || n.role === 'menuitem') }
+      }
+      let { open, options } = await listed()
+      if (!open || !options.length) {
+        await pointerAt(tab, c.ref, {})
+        await settle(tab, policy['explore.waitMs'])
+        options = (await listed()).options
+      }
       const want = (c.text ?? '').trim().toLowerCase()
-      const options = withRefs((await snapshot(tab)).tree).filter(n => n.role === 'option' || n.role === 'menuitemradio' || n.role === 'menuitem')
       const best = options.filter(n => fit(n.name, want) < 3).sort((a, b) => fit(a.name, want) - fit(b.name, want))[0]
       if (!best) {
         await tab.page.keyboard.press('Escape')

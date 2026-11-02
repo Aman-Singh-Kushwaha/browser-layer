@@ -156,6 +156,12 @@ const server = createServer((req, res) => {
   // A custom dropdown: a combobox that opens a listbox of options.
   if (req.url === '/combo') return page('combo', `<div role="combobox" aria-haspopup="listbox" aria-expanded="false" tabindex="0" aria-label="Plan" id="c" onclick="l.hidden = false; c.setAttribute('aria-expanded', 'true')">Free</div>
     <div role="listbox" id="l" hidden>${['Free', 'Pro', 'Team'].map(p => `<div role="option" onclick="c.textContent = '${p}'; l.hidden = true; o.textContent = 'plan ${p}'">${p}</div>`).join('')}</div><p id="o">plan Free</p>`)
+  // A dropdown whose opening re-renders the page around it (every label changes, as Google Flights does).
+  if (req.url === '/relabel') return page('relabel', `<nav><ul>${['Goa', 'Delhi', 'Pune', 'Kochi', 'Agra', 'Surat'].map(c => `<li><a href="/c/${c}">${c}</a></li>`).join('')}</ul></nav>
+    <main><ul>${Array.from({ length: 8 }, (_, i) => `<li><span>Deal ${i}</span> <span>from ₹${1000 + i}</span></li>`).join('')}</ul>
+    <div role="combobox" aria-label="Trip" aria-expanded="false" tabindex="0" id="c" onclick="opened()">Round trip</div>
+    <div role="listbox" id="l" hidden><div role="option">Round trip</div><div role="option" onclick="o.textContent = 'trip One way'; l.hidden = true">One way</div></div><p id="o">trip Round trip</p></main>
+    <script>function opened() { l.hidden = false; c.setAttribute('aria-expanded', 'true'); document.querySelectorAll('a, li span').forEach(e => e.textContent = 'City image for ' + e.textContent) }</script>`)
   const results = req.url?.match(/^\/results\/(\d)$/)
   if (results) return page(`results ${results[1]}`, `<header><a href="/">Home</a> <a href="/deals">Deals</a> <a href="/help">Help</a><p>Free delivery on every order</p></header><main><p>Page ${results[1]}</p>${'<button>Add to cart</button>'.repeat(+results[1])}</main><nav aria-label="Pagination"><a href="/results/${+results[1] + 1}">Next</a></nav>`)
   // A page laid out as three same-looking columns, each holding a region (a web app's shell): layout, not records.
@@ -1078,4 +1084,13 @@ test('a ref the page re-rendered acts on the new element without looking again',
   const target = ref(page.out, /button "Target"/)
   await run('click', ref(page.out, /button "Swap"/))
   assert.match((await run('click', target)).out, /hit/)
+})
+
+test('an action the page re-renders around answers with the map, listing what opened; pick leaves it open', async () => {
+  await run('tab', `${base}/relabel`)
+  const r = await run('click', 'Trip')
+  assert.match(r.out, /— it opened what is below; \[\d+\] list, \[\d+\] list changed too/)
+  assert.match(r.out, /^\+ \[\d+\] option "One way"$/m)
+  assert.doesNotMatch(r.out, /records|City image/)
+  assert.match((await run('pick', 'Trip', 'One way')).out, /trip One way/)
 })

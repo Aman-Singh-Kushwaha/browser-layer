@@ -34,8 +34,9 @@ depends on something you cannot see yet.
    know of open side by side in one call: `tab <url> <url> <url>`. Keep one tab per site and switch
    with `use <id>` (nothing reloads; `tabs` lists them); move within a site with `go <url>`.
 2. Act on a ref or a control's name: `click 31`, `click "Next"`, `type 15 Mumbai --enter`,
-   `pick 22 "Economy"`, `check 40`. Every action answers with **what changed** or the new page, and
-   says when something did not take. That answer is the new state: no need to read again to check.
+   `pick 22 "Economy"`, `check 40`. Every action answers with **what changed** or the new page, with
+   the refs of anything it opened (options, a dialog, a date grid), and says when something did not
+   take. That answer is the new state: no need for `map` or `read` after it.
 3. **Do what you already know in one call** with `steps`: actions answer in one line, reads and the
    last step in full, and the first error stops the rest and shows the page as it is then.
 4. Go deeper only where you need to: `read <ref>` for one region, `find <text>` for the lines that
@@ -70,6 +71,9 @@ Clip lamp	₹499	4.1
   When the site drops a setting you were given, set it another way (its own controls, the URL as it
   writes it). Add no filters of your own.
 - Follow the site's links and its own search rather than guessing deep URLs.
+- A field with suggestions (a city, a product search) opens a list as you type: choose from it
+  (`click` the option, or `press Enter` for the first) before the next field, in the same call:
+  `steps 'type "From" Zurich; press Enter; type "To" London; press Enter'`.
 - **Deliver as you go.** Write the deliverable itself early and update it with each finding, so
   stopping at any moment still leaves your best result. Mark what you have not checked as
   unchecked; never fill it in.

@@ -94,7 +94,7 @@ export async function pointAt(t: Target, timeoutMs: number): Promise<[number, nu
       last = q
     } catch (err) {
       if (/No node|Could not find node/i.test(String(err))) throw err
-      why = err instanceof Error ? err.message : String(err)
+      why = /does not have a layout object/i.test(String(err)) ? 'it is not shown on the page (hidden or closed)' : err instanceof Error ? err.message : String(err)
     }
     if (Date.now() >= end) throw new Error(why)
     await sleep(50)
