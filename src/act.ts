@@ -14,7 +14,17 @@ const BLOCKER = `function (x, y) {
   for (; e; e = e.parentElement || (e.getRootNode() instanceof ShadowRoot ? e.getRootNode().host : null)) if (e === this) return ''
   if (!top) return 'nothing is at its position'
   const what = top.getAttribute('aria-label') || top.innerText || ''
-  return 'covered by <' + top.tagName.toLowerCase() + '>' + (what ? ' "' + what.trim().slice(0, 40) + '"' : '')
+  // The overlay it belongs to (a dialog, a fixed or sticky banner) and the controls that answer or close
+  // it, by name, so the next step can be "click one, then this again" without looking first.
+  let box = top
+  for (let p = top; p && p !== p.ownerDocument.body; p = p.parentElement) {
+    const pos = getComputedStyle(p).position
+    if (pos === 'fixed' || pos === 'sticky' || p.matches('dialog, [role=dialog], [role=alertdialog]')) box = p
+  }
+  const names = [...box.querySelectorAll('button, [role=button], a[href], input[type=submit], input[type=button]')]
+    .map(b => (b.getAttribute('aria-label') || b.innerText || b.value || '').trim().replace(/\\s+/g, ' ')).filter(n => n && n.length <= 40)
+  const controls = [...new Set(names)].slice(0, 6).map(n => '"' + n + '"').join(' · ')
+  return 'covered by <' + top.tagName.toLowerCase() + '>' + (what ? ' "' + what.trim().slice(0, 40) + '"' : '') + (controls ? '; its controls: ' + controls : '')
 }`
 const DISABLED = `function () { return !!this.disabled || this.getAttribute('aria-disabled') === 'true' }`
 const SELECT_CONTENTS = `function () {
@@ -116,6 +126,10 @@ export async function pick(t: Target, option: string) {
   const problem = await call(t, PICK_OPTION, [option])
   if (problem) throw new Error(String(problem))
 }
+
+// What a field holds after typing: its value, or the text of an editable element. A password is not read.
+const HELD = `function () { return this.type === 'password' ? null : 'value' in this ? String(this.value) : this.innerText }`
+export const heldBy = async (t: Target) => (await call(t, HELD)) as string | null
 
 export const isFileInput = async (t: Target) => Boolean(await call(t, IS_FILE_INPUT))
 export const isChecked = async (t: Target) => Boolean(await call(t, CHECKED))

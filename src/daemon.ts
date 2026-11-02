@@ -9,7 +9,7 @@ import { findBrowser } from './browser.js'
 import { home, loadJar, saveJar, type Cookie } from './session.js'
 import { COLLECTIONS, LANDMARKS, humanCheck, isTrigger, newRefs, readTree, withRefs, type Node, type Refs } from './reader.js'
 import { diffLines, findRef, itemsLine, paginate, renderMap, renderText } from './render.js'
-import { call, drag, fill, isChecked, isFileInput, pick, pointer, setFiles, submit, wheel, type Pointer, type Target } from './act.js'
+import { call, drag, fill, heldBy, isChecked, isFileInput, pick, pointer, setFiles, submit, wheel, type Pointer, type Target } from './act.js'
 import { query, records, toTsv, type Query } from './data.js'
 import { ping, socketPath, VERSION } from './client.js'
 import { loadPolicy, type Policy } from './policy.js'
@@ -25,12 +25,34 @@ const SHOT_MAX_PX = 16384
 const CANVAS_RUNS = 5000
 const CANVAS_LINE_PX = 4
 
-// Runs in every document before the page's own scripts. It records, without changing the page: DOM
-// mutations (for settle), elements given hover listeners (the reader marks them "reacts to hover"), and
-// text drawn on 2D canvases with its position, forgetting text a clearRect paints over.
+// Runs in every document before the page's own scripts. It records, without changing the page: a
+// signature of the text the page shows (for settle), elements given hover listeners (the reader marks
+// them "reacts to hover"), and text drawn on 2D canvases with its position, forgetting text a clearRect
+// paints over.
 const PAGE_HOOKS = `(() => {
-  window.__alMut = 0
-  new MutationObserver(() => { window.__alMut++ }).observe(document, { subtree: true, childList: true, attributes: true, characterData: true })
+  // What the agent will read is the shown text, so settle waits on it, not on every DOM change: ads,
+  // timers and animations change the DOM all the time without changing a word.
+  // innerText leaves out shadow trees, so the ones the page creates are kept and their text counted too.
+  window.__alDraws = 0
+  let roots = []
+  const attach = Element.prototype.attachShadow
+  Element.prototype.attachShadow = function (...args) { const r = attach.apply(this, args); roots.push(r); return r }
+  window.__alText = () => {
+    if (roots.length > 1000) roots = roots.filter(r => r.host.isConnected)
+    const t = (document.body ? document.body.innerText : '') + roots.map(r => (r.host.isConnected ? r.textContent : '')).join('')
+    let h = t.length + window.__alDraws
+    for (let i = 0; i < t.length; i++) h = (h * 31 + t.charCodeAt(i)) | 0
+    return h
+  }
+  // Text is present but hardly any of it shows (results revealed after load, a page behind a loader).
+  window.__alHidden = () => {
+    const shown = document.body ? document.body.innerText.length : 0
+    if (shown >= 500) return false
+    let all = 0
+    const w = document.createTreeWalker(document.body || document, NodeFilter.SHOW_TEXT)
+    while (w.nextNode()) if (!/^(SCRIPT|STYLE|NOSCRIPT|TEMPLATE)$/.test(w.currentNode.parentNode.nodeName)) all += w.currentNode.data.trim().length
+    return all > 2000 && all > 4 * shown
+  }
   const HOVER = new Set(['mouseenter', 'mouseover', 'pointerenter', 'pointerover'])
   const CLICK = new Set(['click', 'mousedown', 'mouseup', 'pointerdown', 'pointerup'])
   window.__alHover = new Set()
@@ -56,6 +78,7 @@ const PAGE_HOOKS = `(() => {
         const [px, py] = at(this, x, y)
         m.set(Math.round(px) + ',' + Math.round(py), [String(text), px, py])
         if (m.size > ${CANVAS_RUNS}) m.delete(m.keys().next().value)
+        window.__alDraws++
       } catch {}
       return draw.call(this, text, x, y, ...rest)
     }
@@ -117,11 +140,15 @@ type Tab = {
   // used: when a command last acted on this tab; `tabs` lists by it.
   used: number
   pending: Map<Request, number>; standing: Set<string>; net: Req[]; netId: number; frames: Map<string, Frame>; dialog?: Dialog; opened: number[]
-  downloads: { file: string; size: number; url: string }[]; saving: Promise<void>[]; status?: number
+  downloads: { file: string; size: number; url: string }[]; saving: Promise<void>[]; status?: number; retryAfter?: string
+  // The document the current command began on: another site's data calls count only on that one.
+  startDoc?: number
 }
 export type Command = {
   cmd: string; session: string; urls?: boolean; out?: string; url?: string; ref?: string; text?: string; key?: string; id?: number; enter?: boolean; all?: boolean
   page?: number; files?: string[]; dir?: string; gone?: boolean; keys?: boolean; to?: string; full?: boolean; version?: string
+  // tab: more pages to open beside the first. steps: the commands to run, each with the text it was given as.
+  more?: string[]; steps?: Command[]; raw?: string
 } & Query
 
 // Commands that only read the current page, for the shorter time limit.
@@ -198,27 +225,71 @@ let commandStart = Date.now()
 const channel = (url: string) => { const u = new URL(url); return `${u.origin}${u.pathname}` }
 function beginCommand() {
   commandStart = Date.now()
-  for (const t of tabs.values()) t.standing = new Set([...t.pending.keys()].map(r => channel(r.url())))
+  for (const t of tabs.values()) {
+    t.standing = new Set([...t.pending.keys()].map(r => channel(r.url())))
+    t.startDoc = t.doc
+  }
 }
-// Requests the current command caused that are still in flight.
-const caused = (tab: Tab) => [...tab.pending].filter(([r, at]) => at >= commandStart && !tab.standing.has(channel(r.url()))).length
+// A site is its registrable domain: news.example.co.uk and static.example.co.uk are one site. Two-letter
+// country domains under a short label (co.uk, com.au) take three labels; an IP address is its own site.
+const registrable = (url: string) => {
+  try {
+    const host = new URL(url).hostname
+    if (/^[\d.]+$|:/.test(host)) return host
+    const p = host.split('.')
+    return p.slice(p.length > 2 && p[p.length - 2].length <= 3 && p[p.length - 1].length === 2 ? -3 : -2).join('.')
+  } catch { return '' }
+}
+// Requests the current command caused that are still in flight and that the page's content waits on: the
+// site's own. Another site's requests (ads, analytics, widgets) keep a page busy for seconds and change
+// nothing the agent reads, except the data calls an action on a loaded page starts right away (a search
+// box served by a search API), which count on that page.
+const caused = (tab: Tab) => {
+  const site = registrable(tab.page.url())
+  return [...tab.pending].filter(([r, at]) => {
+    if (at < commandStart || tab.standing.has(channel(r.url())) || r.resourceType() === 'eventsource' || isTracker(r.url())) return false
+    if (registrable(r.url()) === site) return true
+    return tab.doc === tab.startDoc && (r.resourceType() === 'xhr' || r.resourceType() === 'fetch') && at - commandStart < policy['settle.thirdPartyMs']
+  }).length
+}
 
-// Settled when no request is in flight and the DOM has been quiet for settle.quietMs; or a dialog is
-// waiting (the page is blocked until it is answered); or the deadline passes. Says which.
+// Settled when the site's own requests are done and the shown text has not changed for settle.quietMs;
+// or a dialog is waiting (the page is blocked until it is answered); or the deadline passes. A page with
+// plenty of text but hardly any shown is given settle.revealMs to show it. A document that has not
+// finished arriving in load.domMs is read as far as it got. Says which.
 async function settle(tab: Tab, deadline = policy['settle.deadlineMs']): Promise<string> {
   const start = Date.now()
-  await tab.page.waitForLoadState('domcontentloaded', { timeout: policy['load.timeoutMs'] }).catch(() => {})
-  let last = -1
+  const arrived = await tab.page.waitForLoadState('domcontentloaded', { timeout: policy['load.domMs'] }).then(() => true, () => false)
+  if (!arrived) return `still loading after ${policy['load.domMs'] / 1000} s; this is what has arrived`
+  const end = Date.now() + deadline
+  let last: unknown
+  let hidden: boolean | undefined
   let quietSince = Date.now()
-  while (Date.now() - start < deadline) {
+  while (Date.now() < end) {
     if (tab.dialog) return 'dialog'
     // A dialog opening mid-read blocks page scripts, so the read is bounded.
-    const muts = await Promise.race([tab.page.evaluate(() => (window as unknown as { __alMut?: number }).__alMut ?? 0).catch(() => -2), sleep(500).then(() => -3)])
-    if (muts !== last || caused(tab) > 0) { last = muts; quietSince = Date.now() }
-    else if (Date.now() - quietSince >= policy['settle.quietMs']) return `idle in ${Date.now() - start} ms`
+    const text = await Promise.race([tab.page.evaluate('window.__alText?.() ?? 0').catch(() => -2), sleep(500).then(() => -3)])
+    if (text !== last || caused(tab) > 0) { last = text; hidden = undefined; quietSince = Date.now() }
+    else if (Date.now() - quietSince >= policy['settle.quietMs']) {
+      hidden ??= await Promise.race([tab.page.evaluate('window.__alHidden?.() ?? false').catch(() => false), sleep(500).then(() => false)]) === true
+      if (!hidden || Date.now() - quietSince >= policy['settle.revealMs']) return `idle in ${Date.now() - start} ms`
+    }
     await sleep(100)
   }
   return `deadline ${deadline} ms (the page kept changing)`
+}
+
+// How settling ended, for an answer that names it only when it was not the usual quiet page.
+const unusual = (settled: string) => (settled.startsWith('idle') ? '' : settled)
+
+// A 429 asks the client to come back later (RFC 6585): the page is loaded again once, after the wait the
+// site names (Retry-After in seconds), at most load.retryMs. Returns a note for the answer, or ''.
+async function arrive(tab: Tab): Promise<string> {
+  if (tab.status !== 429) return ''
+  const wait = Math.min(Number(tab.retryAfter) > 0 ? Number(tab.retryAfter) * 1000 : 2000, policy['load.retryMs'])
+  await sleep(wait)
+  await tab.page.reload({ waitUntil: 'commit', timeout: policy['load.timeoutMs'] }).catch(() => {})
+  return `the site said too many requests (HTTP 429); loaded again after ${wait / 1000} s`
 }
 
 const caps = () => ({ nameChars: policy['render.nameChars'], labelChars: policy['render.labelChars'] })
@@ -259,6 +330,19 @@ async function mapView(tab: Tab, snap?: Awaited<ReturnType<typeof snapshot>>, se
   const map = renderMap(tree, origin, caps(), policy['render.mapFew'], { before: whole ? new Map() : tab.seen.map, now })
   for (const [ref, whole] of now) tab.seen.map.set(ref, whole)
   return `${await header(tab)}${note ? `  — ${note}` : ''}${settled ? `  — settled: ${settled}` : ''}\n${blocked(tab, tree)}\n${map}\n\n(read <ref> opens a region · read gives the whole page)`
+}
+
+// A page just arrived, as a person takes it in: a short one whole (regions already shown, unchanged, one
+// line each), so reading it is not a second call; a long one as its map.
+async function pageView(tab: Tab, snap?: Awaited<ReturnType<typeof snapshot>>, settled = '', note = ''): Promise<string> {
+  snap ??= await snapshot(tab)
+  const now = new Map<number, string>()
+  const short = renderText(snap.tree, snap.origin, caps(), { before: tab.seen.text, now })
+  if (short.length > policy['open.pageChars']) return mapView(tab, snap, settled, note)
+  remember(tab, snap.text)
+  for (const [ref, whole] of now) { tab.seen.text.set(ref, whole); tab.seen.map.set(ref, whole) }
+  tab.read = { doc: tab.doc, text: snap.text }
+  return `${await header(tab)}  — the whole page${note ? `; ${note}` : ''}${settled ? `; settled: ${settled}` : ''}\n${blocked(tab, snap.tree)}\n${short}`
 }
 
 // The page's text, or one region's, as the agent reads it.
@@ -349,7 +433,7 @@ function changedCollections(snap: Awaited<ReturnType<typeof snapshot>>, added: s
 async function changes(tab: Tab, settled = ''): Promise<string> {
   const snap = await snapshot(tab)
   const before = tab.shown.get(contextOf(snap.text))
-  if (!before || before.doc !== tab.doc) return mapView(tab, snap, settled)
+  if (!before || before.doc !== tab.doc) return pageView(tab, snap, settled)
   const { removed, added } = diffLines(before.text.split('\n'), snap.text.split('\n'))
   const size = [...removed, ...added].reduce((n, l) => n + l.length + 3, 0)
   // Changed lines longer than the page itself: the page was replaced. Like a new view, it is answered
@@ -446,15 +530,23 @@ function targetOf(tab: Tab, ref?: string): Target {
   return { cdp, page: tab.cdp, id: at.id, offset: () => offsetOf(tab, at.scope) }
 }
 
-// A ref whose node is gone (re-rendered, navigated away) fails here with the same advice.
+// The engine's ways of saying the element left the page: apps re-render, replacing what was read.
+const GONE = /No node with given id|No node found|Could not find node|detached from document/i
+
+// A ref the page re-rendered, or that a new page has again, is the same element by its identity (reader
+// Refs): the page is read once more and the action goes to it, instead of failing for the agent to look
+// again. Only a ref the page no longer has fails, with the same advice.
 async function act(tab: Tab, ref: string | undefined, fn: (t: Target) => Promise<void>) {
-  const t = targetOf(tab, ref)
-  try {
-    await fn(t)
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err)
-    // The engine's ways of saying the element left the page: apps re-render, replacing what was read.
-    throw new Error(/No node with given id|No node found|Could not find node|detached from document/i.test(msg) ? `[${ref}] is not on the page any more (it changed) — run: browser-layer map` : `cannot act on [${ref}]: ${msg}`)
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await fn(targetOf(tab, ref))
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err)
+      const gone = GONE.test(msg) || /is not on the page —/.test(msg)
+      if (gone && attempt === 0 && /^\d+$/.test(ref ?? '')) { await snapshot(tab); continue }
+      if (/is not on the page —|is in a frame that is gone|expected a ref number/.test(msg)) throw err
+      throw new Error(GONE.test(msg) ? `[${ref}] is not on the page any more (it changed) — run: browser-layer map` : `cannot act on [${ref}]: ${msg}${/its controls: /.test(msg) ? ' (click one by name, then this again)' : ''}`)
+    }
   }
 }
 
@@ -485,7 +577,11 @@ async function setupTab(session: string, page: Page): Promise<Tab> {
     tab.frames.clear()
   })
   // The status the page itself came with; a refusal (403, 429) is told apart from a page that merely says no.
-  page.on('response', r => { if (r.request().isNavigationRequest() && r.frame() === page.mainFrame()) tab.status = r.status() })
+  page.on('response', r => {
+    if (!r.request().isNavigationRequest() || r.frame() !== page.mainFrame()) return
+    tab.status = r.status()
+    tab.retryAfter = r.headers()['retry-after']
+  })
   // Dialogs wait for the agent: an unanswered confirm() is a decision, not something to auto-dismiss.
   page.on('dialog', d => { tab.dialog = d })
   page.on('download', d => {
@@ -503,10 +599,27 @@ async function setupTab(session: string, page: Page): Promise<Tab> {
   return tab
 }
 
+// Navigations return once the response begins; settle then waits for the document (load.domMs at most).
+const COMMIT = () => ({ waitUntil: 'commit' as const, timeout: policy['load.timeoutMs'] })
+
 async function newTab(session: string, url: string): Promise<Tab> {
   const tab = await setupTab(session, await ctx.newPage())
-  await tab.page.goto(withUrl(url), { waitUntil: 'domcontentloaded', timeout: policy['load.timeoutMs'] })
+  await tab.page.goto(withUrl(url), COMMIT())
   return tab
+}
+
+// tab <url>: a page already open in this session is switched to, as a browser's "switch to tab" does (no
+// second copy to load and keep track of); any other opens in a new tab, which becomes current.
+async function openTab(session: string, url: string): Promise<{ tab: Tab; text: string }> {
+  const open = [...tabs.values()].find(t => t.session === session && pageOf(t.page.url()) === pageOf(new URL(withUrl(url)).href))
+  if (open) {
+    open.used = Date.now()
+    current.set(session, open.id)
+    return { tab: open, text: await mapView(open, undefined, '', 'already open here, so this is that tab (reload loads it again)', true) }
+  }
+  const tab = await newTab(session, url)
+  const note = await arrive(tab)
+  return { tab, text: await pageView(tab, undefined, unusual(await settle(tab)), note) }
 }
 
 // What an action did: a dialog waiting, a pop-up that opened (it becomes current, answered with its
@@ -523,7 +636,7 @@ async function answer(tab: Tab): Promise<string> {
   const popup = tabs.get(tab.opened.splice(0).pop() ?? 0)
   if (popup) {
     await settle(popup)
-    return [...notes, `opened tab ${popup.id} (a pop-up of tab ${tab.id}); it is now current`, '', await mapView(popup)].join('\n')
+    return [...notes, `opened tab ${popup.id} (a pop-up of tab ${tab.id}); it is now current`, '', await pageView(popup)].join('\n')
   }
   const body = await changes(tab, settled)
   return notes.length ? `${notes.join('\n')}\n${body}` : body
@@ -602,35 +715,56 @@ async function run(c: Command): Promise<string> {
   }
   switch (c.cmd) {
     case 'tab': {
-      // A page already open in this session is switched to, as a browser's "switch to tab" does: no second
-      // copy to load and keep track of.
-      const open = [...tabs.values()].find(t => t.session === c.session && pageOf(t.page.url()) === pageOf(new URL(withUrl(c.url ?? 'about:blank')).href))
-      if (open) {
-        open.used = Date.now()
-        current.set(c.session, open.id)
-        return mapView(open, undefined, '', 'already open here, so this is that tab (reload loads it again)', true)
-      }
-      const tab = await newTab(c.session, c.url ?? 'about:blank')
-      await settle(tab)
-      return mapView(tab)
+      const urls = [c.url ?? 'about:blank', ...(c.more ?? [])]
+      if (urls.length === 1) return (await openTab(c.session, urls[0])).text
+      // Several pages load side by side, as a person opens links in new tabs, and each answers as if opened
+      // alone; one that fails says so without stopping the others. The last one given is current.
+      const opened = await Promise.all(urls.map(u => openTab(c.session, u).catch(err => ({ tab: undefined, text: `${u}  — error: ${err instanceof Error ? err.message.split('\n')[0] : err}` }))))
+      const last = opened.map(o => o.tab).filter(t => t !== undefined).pop()
+      if (last) current.set(c.session, last.id)
+      return opened.map(o => o.text).join('\n\n')
     }
     case 'go': {
       const tab = need(c.session)
       // A page can ask before it is left (beforeunload): that dialog waits for the agent like any other.
-      await untilDialog(tab, tab.page.goto(withUrl(c.url!), { waitUntil: 'domcontentloaded', timeout: policy['load.timeoutMs'] }))
+      await untilDialog(tab, tab.page.goto(withUrl(c.url!), COMMIT()))
       if (tab.dialog) return answer(tab)
-      await settle(tab)
-      return mapView(tab)
+      const note = await arrive(tab)
+      return pageView(tab, undefined, unusual(await settle(tab)), note)
     }
     case 'back':
     case 'forward':
     case 'reload': {
       const tab = need(c.session)
-      const opts = { waitUntil: 'domcontentloaded' as const, timeout: policy['load.timeoutMs'] }
-      await untilDialog(tab, c.cmd === 'back' ? tab.page.goBack(opts) : c.cmd === 'forward' ? tab.page.goForward(opts) : tab.page.reload(opts))
+      await untilDialog(tab, c.cmd === 'back' ? tab.page.goBack(COMMIT()) : c.cmd === 'forward' ? tab.page.goForward(COMMIT()) : tab.page.reload(COMMIT()))
       if (tab.dialog) return answer(tab)
-      await settle(tab)
-      return mapView(tab)
+      const note = await arrive(tab)
+      return pageView(tab, undefined, unusual(await settle(tab)), note)
+    }
+    case 'steps': {
+      // Several commands in one call, run in order as if sent one by one. A read answers in full, an action
+      // in its first line, the last step in full: what the agent planned ahead needs no answer of its own.
+      // The first error, dialog or block stops the rest, and the answer ends with the page as it is then.
+      const list = c.steps ?? []
+      const lines: string[] = []
+      for (const [k, s] of list.entries()) {
+        s.session = c.session
+        const at = `${k + 1}. ${s.raw ?? s.cmd}`
+        let text: string
+        try {
+          text = await limited(s)
+        } catch (err) {
+          lines.push(`${at}  → error: ${err instanceof Error ? err.message.split('\n')[0] : err}`)
+          const tab = tabs.get(current.get(c.session) ?? 0)
+          lines.push(`stopped at step ${k + 1} of ${list.length}${tab ? '; the page now:' : ''}`)
+          if (tab) lines.push('', await changes(tab))
+          return lines.join('\n')
+        }
+        const stop = / dialog is open: |\nblocked: /.test(text) && k < list.length - 1
+        lines.push(k === list.length - 1 || stop || READS.has(s.cmd) || s.cmd === 'eval' ? `${at}\n${text}` : `${at}  → ${text.split('\n')[0]}`)
+        if (stop) return [...lines, `stopped at step ${k + 1} of ${list.length}: answer it first`].join('\n')
+      }
+      return lines.join('\n')
     }
     case 'tabs': {
       // The session's activity map: its tabs, most recently used first.
@@ -671,12 +805,23 @@ async function run(c: Command): Promise<string> {
     case 'type': {
       const tab = need(c.session)
       // --keys sends one key event per character, for fields that listen to keys rather than input.
+      let held: string | null = null
       await act(tab, c.ref, async t => {
         await fill(t, c.keys ? '' : c.text ?? '')
         if (c.keys) await tab.page.keyboard.type(c.text ?? '')
+        held = await heldBy(t).catch(() => null)
       })
-      if (c.enter) await untilDialog(tab, tab.page.keyboard.press('Enter'))
-      return answer(tab)
+      // What did not take is said in the same answer, so the agent does not look again to find out: a
+      // field that changed what was typed (a mask, a limit), and an Enter that did nothing on the page.
+      const words = (s: string) => s.replace(/\s+/g, ' ').trim()
+      const notes = held !== null && words(held) !== words(c.text ?? '') ? [`note: [${c.ref}] holds ${JSON.stringify(words(held).slice(0, policy['render.nameChars']))}, not what was typed`] : []
+      if (!c.enter) return [await answer(tab), ...notes].join('\n')
+      const before = { url: tab.page.url(), doc: tab.doc, text: await tab.page.evaluate('window.__alText?.()').catch(() => -1) }
+      await untilDialog(tab, tab.page.keyboard.press('Enter'))
+      const out = await answer(tab)
+      if (!tab.dialog && tab.doc === before.doc && tab.page.url() === before.url && await tab.page.evaluate('window.__alText?.()').catch(() => -2) === before.text)
+        notes.push('note: Enter changed nothing on the page; the form may need its own button (click it by name)')
+      return [out, ...notes].join('\n')
     }
     case 'check':
     case 'uncheck': {
@@ -737,7 +882,24 @@ async function run(c: Command): Promise<string> {
     }
     case 'pick': {
       const tab = need(c.session)
-      await act(tab, c.ref, t => pick(t, c.text ?? ''))
+      try {
+        await act(tab, c.ref, t => pick(t, c.text ?? ''))
+        return answer(tab)
+      } catch (err) {
+        if (!/not a <select>/.test(String(err))) throw err
+      }
+      // A custom dropdown (an ARIA combobox or listbox): opened and its option clicked by name, as a person
+      // picks one. An option that is not there closes it again (Escape) and lists what it offers.
+      await pointerAt(tab, c.ref, {})
+      await settle(tab, policy['explore.waitMs'])
+      const want = (c.text ?? '').trim().toLowerCase()
+      const options = withRefs((await snapshot(tab)).tree).filter(n => n.role === 'option' || n.role === 'menuitemradio' || n.role === 'menuitem')
+      const best = options.filter(n => fit(n.name, want) < 3).sort((a, b) => fit(a.name, want) - fit(b.name, want))[0]
+      if (!best) {
+        await tab.page.keyboard.press('Escape')
+        throw new Error(`no option "${c.text}"; options: ${options.slice(0, policy['render.mapFew']).map(o => o.name).join(' | ') || '(none appeared when it opened)'}`)
+      }
+      await pointerAt(tab, String(best.ref), {})
       return answer(tab)
     }
     case 'press': {
@@ -916,6 +1078,15 @@ async function run(c: Command): Promise<string> {
   }
 }
 
+// A page whose renderer stopped answering (a script that never returns) would hold every later command
+// behind it; the command fails instead, and other tabs carry on. Reading the page takes seconds at most, so
+// a read gives up sooner than a command that loads a page. Each of a call's steps has its own limit.
+function limited(c: Command): Promise<string> {
+  const limit = policy[READS.has(c.cmd) ? 'read.timeoutMs' : 'command.timeoutMs']
+  return Promise.race([run(c), new Promise<never>((_, fail) => setTimeout(() => fail(new Error(
+    `the page did not answer in ${limit / 1000} s; it may be stuck: browser-layer close it and open it again`)), limit))])
+}
+
 // A Unix socket is a file left behind on exit; a Windows named pipe goes away with its server.
 const dropSocket = () => { if (process.platform !== 'win32') rmSync(socketPath(), { force: true }) }
 
@@ -993,12 +1164,7 @@ async function main() {
         try {
           c.session ||= 'default'
           await pullCookies()
-          // A page whose renderer stopped answering (a script that never returns) would hold every later
-          // command behind it; the command fails instead, and other tabs carry on. Reading the page takes
-          // seconds at most, so a read gives up sooner than a command that loads a page.
-          const limit = policy[READS.has(c.cmd) ? 'read.timeoutMs' : 'command.timeoutMs']
-          const text = await Promise.race([run(c), new Promise<never>((_, fail) => setTimeout(() => fail(new Error(
-            `the page did not answer in ${limit / 1000} s; it may be stuck: browser-layer close it and open it again`)), limit))])
+          const text = await (c.cmd === 'steps' ? run(c) : limited(c))
           await syncCookies().catch(() => {})
           res.end(JSON.stringify({ ok: true, text }))
         } catch (err) {

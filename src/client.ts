@@ -72,8 +72,10 @@ function startDaemon() {
 }
 
 export async function live(c: Command): Promise<Reply> {
+  // Each of a call's steps has the daemon's own time limit, so the call waits for all of them.
+  const wait = 90000 * Math.max(1, c.steps?.length ?? 1)
   try {
-    const reply = await send({ ...c, version: VERSION })
+    const reply = await send({ ...c, version: VERSION }, wait)
     // A daemon from another version stopped instead of answering; this version's starts below.
     if (!reply.stale) return reply
     if (c.cmd === 'stop') return { ok: true, text: 'stopped' }
@@ -93,7 +95,7 @@ export async function live(c: Command): Promise<Reply> {
   try {
     for (let i = 0; i < 150; i++) {
       await new Promise(r => setTimeout(r, 150))
-      if (await ping()) return send(c)
+      if (await ping()) return send(c, wait)
     }
   } finally {
     if (mine) rmSync(lockPath(), { force: true })

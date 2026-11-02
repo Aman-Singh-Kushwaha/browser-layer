@@ -33,6 +33,7 @@ const APP = `<!doctype html><title>Trip</title><body><div id="app"></div><script
 
 let base = ''
 let booked = ''
+let tooMany = 0
 const server = createServer((req, res) => {
   if (req.url === '/login') {
     res.setHeader('set-cookie', 'fast=1; Path=/')
@@ -132,6 +133,29 @@ const server = createServer((req, res) => {
   if (req.url === '/longrecords') return page('longrecords', `<ul>${Array.from({ length: 40 }, (_, i) => `<li><b>Item ${i}</b> <span>${'detail '.repeat(140)}</span></li>`).join('')}</ul>`)
   if (req.url === '/years') return page('years', `<p id="y">none</p>${[2022, 2023].map(n => `<button onclick="y.textContent = 'picked ${n}'">${n}</button>`).join('')}<button onclick="y.textContent = 'picked page'">Page 2023 of 2024</button>`)
   if (req.url === '/rerender') return page('rerender', `<p id="s">not yet</p><button id="t" onclick="s.textContent = 'hit'">Target</button><button onclick="t.replaceWith(t.cloneNode(true))">Swap</button>`)
+  // Another site's request that never finishes (an ad server) beside the site's own data call.
+  if (req.url === '/thirdparty') return page('thirdparty', `<p id="o">loading</p><script>fetch('http://localhost:${port}/hang').catch(() => {})
+    fetch('/slow').then(r => r.text()).then(t => o.textContent = 'own data: ' + t)</script>`)
+  if (req.url === '/hang') return
+  // Too many requests once, then the page.
+  if (req.url === '/busy-site') {
+    if (!tooMany++) { res.statusCode = 429; res.setHeader('retry-after', '1'); return page('429', '<h1>Too Many Requests</h1>') }
+    return page('busy-site', '<p>served after the wait</p>')
+  }
+  // Results already in the page but shown only after a moment, as some search pages do.
+  if (req.url === '/shown-late') return page('shown-late', `<style>.off { display: none }</style><p>Search</p>
+    <ol id="r" class="off">${Array.from({ length: 60 }, (_, i) => `<li>Result ${i}: a result long enough to count as content on this page</li>`).join('')}</ol>
+    <script>setTimeout(() => r.classList.remove('off'), 900)</script>`)
+  // A document whose end arrives late: what came first is still readable.
+  if (req.url === '/slowdoc') { res.setHeader('content-type', 'text/html'); res.write('<title>slowdoc</title><p>first part</p>'); return void setTimeout(() => res.end('<p>last part</p>'), 4000) }
+  // A banner over a control, with buttons that answer it.
+  if (req.url === '/banner') return page('banner', `<button onclick="o.textContent = 'reached'">Behind</button><p id="o">not yet</p>
+    <div id="b" style="position:fixed;inset:0;background:#fff"><p>We use cookies</p><button onclick="b.remove()">Reject all</button><button onclick="b.remove()">Accept all</button></div>`)
+  // A field that rewrites what is typed, and one outside any form, where Enter does nothing.
+  if (req.url === '/fields') return page('fields', `<input aria-label="Code" oninput="this.value = this.value.toUpperCase()"><input aria-label="Loose">`)
+  // A custom dropdown: a combobox that opens a listbox of options.
+  if (req.url === '/combo') return page('combo', `<div role="combobox" aria-haspopup="listbox" aria-expanded="false" tabindex="0" aria-label="Plan" id="c" onclick="l.hidden = false; c.setAttribute('aria-expanded', 'true')">Free</div>
+    <div role="listbox" id="l" hidden>${['Free', 'Pro', 'Team'].map(p => `<div role="option" onclick="c.textContent = '${p}'; l.hidden = true; o.textContent = 'plan ${p}'">${p}</div>`).join('')}</div><p id="o">plan Free</p>`)
   const results = req.url?.match(/^\/results\/(\d)$/)
   if (results) return page(`results ${results[1]}`, `<header><a href="/">Home</a> <a href="/deals">Deals</a> <a href="/help">Help</a><p>Free delivery on every order</p></header><main><p>Page ${results[1]}</p>${'<button>Add to cart</button>'.repeat(+results[1])}</main><nav aria-label="Pagination"><a href="/results/${+results[1] + 1}">Next</a></nav>`)
   // A page laid out as three same-looking columns, each holding a region (a web app's shell): layout, not records.
@@ -257,7 +281,7 @@ const server = createServer((req, res) => {
 
 const home = mkdtempSync(join(tmpdir(), 'al-'))
 // Short waits so the failure paths (covered, never quiet) are tested in seconds, not the defaults.
-writeFileSync(join(home, 'policy.json'), JSON.stringify({ 'actions.timeoutMs': 1500, 'settle.deadlineMs': 2000, 'wait.timeoutMs': 3000, 'command.timeoutMs': 8000 }))
+writeFileSync(join(home, 'policy.json'), JSON.stringify({ 'actions.timeoutMs': 1500, 'settle.deadlineMs': 2000, 'wait.timeoutMs': 3000, 'command.timeoutMs': 8000, 'load.domMs': 2000 }))
 const upload = join(home, 'upload-test.txt')
 writeFileSync(upload, 'resume')
 // Deep enough that home/daemon.sock passes the ~104-byte Unix socket path limit.
@@ -277,8 +301,8 @@ const run = (...args: string[]) => runIn(home, ...args)
 const killByArgument = (arg: string) => new Promise(r => (process.platform === 'win32'
   ? execFile('powershell', ['-NoProfile', '-Command', `Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like '*${arg.replace(/'/g, "''")}*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }`], r)
   : execFile('pkill', ['-f', arg], r)))
-// Opening answers with the map; these tests check page content, so they read the whole page next.
-const openRead = async (url: string) => { await run('tab', url); return run('read') }
+// Opening answers with the page, or its map when long; these tests check page content, so they read it whole.
+const openRead = async (url: string) => { await run('tab', url); return run('read', '--full') }
 
 const ref = (out: string, what: RegExp) => {
   const m = out.match(new RegExp(`\\[(\\d+)\\] ${what.source}`))
@@ -293,6 +317,8 @@ before(() => new Promise<void>(r => server.listen(0, '127.0.0.1', () => {
 after(async () => {
   await run('stop')
   await runIn(deepHome, 'stop')
+  // /hang never answers: its connection is closed here, or the server would wait on it forever.
+  server.closeAllConnections()
   server.close()
   rmSync(home, { recursive: true, force: true })
 })
@@ -335,8 +361,8 @@ test('sessions keep their own tabs and cannot touch each other', async () => {
   const a = await run('--session', 'a', 'tab', `${base}/page/alpha`)
   await run('--session', 'b', 'tab', `${base}/page/beta`)
   const aId = a.out.match(/^tab (\d+)/)![1]
-  assert.match((await run('--session', 'a', 'read')).out, /page alpha/)
-  assert.match((await run('--session', 'b', 'read')).out, /page beta/)
+  assert.match(a.out, /page alpha/)
+  assert.match((await run('--session', 'b', 'read', '--full')).out, /page beta/)
   assert.doesNotMatch((await run('--session', 'b', 'tabs')).out, /alpha/)
   const r = await run('--session', 'b', 'use', aId)
   assert.equal(r.code, 1)
@@ -371,8 +397,9 @@ test('the live view: one line per row, aria-hidden text without refs, hidden lab
   assert.ok(label && label[1].length === DEFAULTS['render.labelChars'] && label[1].endsWith('…'), out)
 })
 
-test('a page opens as a map of regions; read <ref> opens one region', async () => {
-  const map = await run('tab', `${base}/regions`)
+test('a page shows as a map of regions; read <ref> opens one region', async () => {
+  await run('tab', `${base}/regions`)
+  const map = await run('map')
   assert.match(map.out, /^\[\d+\] navigation "Main"\n  links: \[\d+\] link "Home" · \[\d+\] link "About"$/m)
   assert.match(map.out, /^\[\d+\] search\n  fields: \[\d+\] searchbox "Search flights"\n  actions: \[\d+\] button "Go"$/m)
   assert.match(map.out, /^\[\d+\] main\n  headings: Results\n  \[\d+\] list of 12: • Flight 0 · ₹100 …$/m)
@@ -383,7 +410,8 @@ test('a page opens as a map of regions; read <ref> opens one region', async () =
 })
 
 test('get turns a list or table into records that line up, sort as numbers, and limit', async () => {
-  const map = await run('tab', `${base}/data`)
+  await run('tab', `${base}/data`)
+  const map = await run('map')
   const list = ref(map.out, /list of 4/)
   const table = ref(map.out, /table of 2: columns Name · Size/)
   const all = await run('get', list)
@@ -472,11 +500,9 @@ test('get --urls gives each record its links and pictures, each address once; pl
 })
 
 test('images are not loaded until the agent allows them for a site', async () => {
-  await run('tab', `${base}/pictured`)
-  assert.match((await run('read')).out, /image missing/)
+  assert.match((await run('tab', `${base}/pictured`)).out, /image missing/)
   assert.match((await run('allow', 'images')).out, /allowed images for http:\/\/127\.0\.0\.1:\d+ \(reload to load them\)/)
-  await run('reload')
-  assert.match((await run('read')).out, /image loaded/)
+  assert.match((await run('reload')).out, /image loaded/)
 })
 
 test('a whole-page screenshot taller than Chrome can capture stops at the limit and says so', async () => {
@@ -505,13 +531,14 @@ test('screenshot saves a PNG of the tab: the visible part, the whole page, or on
 })
 
 test('repeated cards without list markup are records; repeated paragraphs are not', async () => {
-  const map = await run('tab', `${base}/cards`)
+  await run('tab', `${base}/cards`)
+  const map = await run('map')
   assert.match(map.out, /\[\d+\] list of 4: /)
   assert.doesNotMatch(map.out, /list of 5/)
   const cheap = await run('get', ref(map.out, /list of 4/), '--sort', 'c2', '--limit', '2')
   assert.match(cheap.out, /^c1\tc2\nAcer Aspire\t₹32,990\nDell 14\t₹41,500$/m)
   // The page reads as before: a detected collection does not turn cards into single lines.
-  assert.match((await run('read')).out, /^### Acer Aspire\n₹32,990$/m)
+  assert.match((await run('read', '--full')).out, /^### Acer Aspire\n₹32,990$/m)
 })
 
 test('reading never changes the page', async () => {
@@ -532,7 +559,7 @@ test('actions answer with what changed; a new page answers with its map', async 
   assert.match((await run('read', '--full')).out, /story 5[\s\S]*loaded more/)
   const next = await run('click', ref(full.out, /link "next page"/))
   assert.match(next.out, /^tab \d+ .*\/page\/next/)
-  assert.match(next.out, /read <ref> opens a region/)
+  assert.match(next.out, /— the whole page/)
 })
 
 test('a pushState URL change keeps refs and answers with changes', async () => {
@@ -569,14 +596,13 @@ test('long views come in pages and every page is reachable', async () => {
 test('a home dir deeper than the socket path limit still starts the daemon', async () => {
   mkdirSync(deepHome, { recursive: true })
   assert.equal((await runIn(deepHome, 'tab', `${base}/page/deep`)).code, 0)
-  const r = await runIn(deepHome, 'read')
+  const r = await runIn(deepHome, 'read', '--full')
   assert.equal(r.code, 0, r.out)
   assert.match(r.out, /page deep/)
 })
 
 test('reads and acts inside same-origin and cross-origin iframes', async () => {
-  await run('tab', `${base}/frames`)
-  const all = await run('read')
+  const all = await run('tab', `${base}/frames`)
   assert.match(all.out, /button "Same button"/)
   assert.match(all.out, /textbox "Card number"/)
   await run('type', ref(all.out, /textbox "Card number"/), '4242')
@@ -619,7 +645,7 @@ test('a pop-up opens as a tab in the same session and becomes current', async ()
   const r = await run('click', ref(page.out, /link "open help"/))
   assert.match(r.out, /opened tab \d+ \(a pop-up of tab \d+\); it is now current/)
   assert.match(r.out, /\/page\/popped/)
-  assert.match((await run('read')).out, /page popped/)
+  assert.match(r.out, /page popped/)
 })
 
 test('downloads are saved and reported; uploads go through inputs and file choosers', async () => {
@@ -677,8 +703,7 @@ test('a result bigger than one answer goes whole to a file with --out; find page
 })
 
 test('reading a page again answers with what changed since the last read; --full gives it all', async () => {
-  await run('tab', `${base}/counter`)
-  assert.match((await run('read')).out, /count 0/)
+  assert.match((await run('tab', `${base}/counter`)).out, /count 0/)
   assert.match((await run('read')).out, /— no change since your last read \(read --full shows it again\)/)
   await run('click', 'Add')
   const again = (await run('read')).out
@@ -711,13 +736,13 @@ test('a region already shown, unchanged, is one line on the next page; read --fu
   await run('stop')
   const first = (await run('tab', `${base}/results/1`)).out
   const banner = ref(first, /banner/)
-  assert.match(first, /links: .*"Deals"/)
+  assert.match(first, /link "Deals"/)
   const second = (await run('click', 'Next')).out
   assert.match(second, new RegExp(`\\[${banner}\\] banner — shown before, unchanged`))
   assert.doesNotMatch(second, /"Deals"/)
-  assert.match((await run('read')).out, /Free delivery/)
-  await run('click', 'Next')
-  const third = (await run('read')).out
+  // What the next page showed is what the agent has: reading it again adds nothing.
+  assert.match((await run('read')).out, /no change since your last read/)
+  const third = (await run('click', 'Next')).out
   assert.match(third, new RegExp(`\\[${banner}\\] banner — shown before, unchanged`))
   assert.match(third, /Page 3/)
   assert.doesNotMatch(third, /Free delivery/)
@@ -757,7 +782,8 @@ test('the same element on the next page keeps its ref; one that is no longer uni
 })
 
 test('columns that hold parts of the page are layout, not records; cards that hold a form are records', async () => {
-  const map = (await run('tab', `${base}/shell`)).out
+  await run('tab', `${base}/shell`)
+  const map = (await run('map')).out
   assert.equal(map.match(/list of 3/g)?.length, 1)
   assert.match(map, /list of 3: ### Lamp/)
 })
@@ -799,7 +825,7 @@ test('a session saved by a normal browser window on the agent profile carries in
   await (await browser.newBrowserCDPSession()).send('Browser.close').catch(() => {})
   await new Promise(r => chrome.on('exit', r))
   await runIn(dir, 'tab', `${base}/who`)
-  assert.match((await runIn(dir, 'read')).out, /who: signed in/)
+  assert.match((await runIn(dir, 'read', '--full')).out, /who: signed in/)
   await runIn(dir, 'stop')
   rmSync(dir, { recursive: true, force: true })
 })
@@ -829,7 +855,7 @@ test('when the browser goes away (window closed, crash), the next command starts
   await new Promise(r => setTimeout(r, 1500))
   const again = await runIn(dir, 'tab', `${base}/page/two`)
   assert.equal(again.code, 0, again.out)
-  assert.match((await runIn(dir, 'read')).out, /page two/)
+  assert.match(again.out, /page two/)
   await runIn(dir, 'stop')
   rmSync(dir, { recursive: true, force: true })
 })
@@ -844,9 +870,9 @@ test('controls say what they reveal and whether they react to hover, before any 
 })
 
 test('text drawn on a canvas reads as lines, and text painted over is forgotten', async () => {
-  const map = (await run('tab', `${base}/canvas`)).out
+  const out = (await run('tab', `${base}/canvas`)).out
+  const map = (await run('map')).out
   assert.match(map, /\[\d+\] canvas: 2 lines — Name · Price …/)
-  const out = (await run('read')).out
   assert.match(out, /^Name · Price\nTea · ₹40$/m)
   assert.doesNotMatch(out, /stale/)
   const rows = await run('get', ref(map, /canvas: 2 lines/), '--sort', 'c1', '--desc')
@@ -855,7 +881,8 @@ test('text drawn on a canvas reads as lines, and text painted over is forgotten'
 })
 
 test('explore opens every declared menu, reads it, closes it, and never runs a command', async () => {
-  const map = (await run('tab', `${base}/menus`)).out
+  await run('tab', `${base}/menus`)
+  const map = (await run('map')).out
   assert.match(map, /closed menus and pop-ups: 2 \(browser-layer explore lists what they hold\)/)
   const out = (await run('explore')).out
   assert.match(out, /2 declared menus and pop-ups, each opened, read and closed/)
@@ -972,4 +999,83 @@ test('stale refs and missing tabs fail with a clear message', async () => {
   const r = await run('click', '9999')
   assert.equal(r.code, 1)
   assert.match(r.out, /\[9999\] is not on the page/)
+})
+
+test('another site\'s requests do not hold a page; the site\'s own data call does', async () => {
+  const t0 = Date.now()
+  const r = await run('tab', `${base}/thirdparty`)
+  assert.match(r.out, /own data: slow data/)
+  assert.ok(Date.now() - t0 < 6000, `took ${Date.now() - t0} ms`)
+})
+
+test('a short page answers whole when opened, and reading it next says nothing changed', async () => {
+  const r = await run('tab', `${base}/page/whole`)
+  assert.match(r.out, /— the whole page/)
+  assert.match(r.out, /page whole/)
+  assert.match((await run('read')).out, /no change since your last read/)
+})
+
+test('too many requests (429) waits as the site asks and loads the page again', async () => {
+  const r = await run('tab', `${base}/busy-site`)
+  assert.match(r.out, /HTTP 429\); loaded again after 1 s/)
+  assert.match(r.out, /served after the wait/)
+})
+
+test('text already in the page but shown a moment later is waited for', async () => {
+  assert.match((await run('tab', `${base}/shown-late`)).out, /Result 59/)
+})
+
+test('a document whose end is slow to arrive is read as far as it got', async () => {
+  const r = await run('tab', `${base}/slowdoc`)
+  assert.match(r.out, /still loading after 2 s/)
+  assert.match(r.out, /first part/)
+})
+
+test('several pages open side by side in one call; the last is current', async () => {
+  const r = await run('tab', `${base}/page/one`, `${base}/page/two`)
+  assert.match(r.out, /page one[\s\S]*page two/)
+  assert.match((await run('tabs')).out, /^\* \d+ +\S+\/page\/two/m)
+})
+
+test('steps runs several commands in one call: actions in one line, reads and the last in full', async () => {
+  await run('tab', `${base}/form2`)
+  const r = await run('steps', 'type Query "hello there"; press Enter; find submitted')
+  assert.equal(r.code, 0, r.out)
+  assert.match(r.out, /^1\. type Query "hello there"  → tab \d+ /m)
+  assert.match(r.out, /^2\. press Enter  → tab \d+ /m)
+  assert.match(r.out, /^3\. find submitted\n1 lines with "submitted"\n\nsubmitted hello there/m)
+  const stop = await run('steps', 'click 99999; find submitted')
+  assert.equal(stop.code, 1)
+  assert.match(stop.out, /1\. click 99999  → error: \[99999\] is not on the page/)
+  assert.match(stop.out, /stopped at step 1 of 2; the page now:/)
+  assert.doesNotMatch(stop.out, /2\. find/)
+})
+
+test('a covered control names what covers it and the buttons that answer it', async () => {
+  await run('tab', `${base}/banner`)
+  const r = await run('click', 'Behind')
+  assert.equal(r.code, 1)
+  assert.match(r.out, /covered by <\w+> "We use cookies[^"]*"; its controls: "Reject all" · "Accept all" \(click one by name, then this again\)/)
+  assert.match((await run('steps', 'click "Reject all"; click Behind')).out, /reached/)
+})
+
+test('typing says when the field holds something else, and when Enter did nothing', async () => {
+  await run('tab', `${base}/fields`)
+  assert.match((await run('type', 'Code', 'abc')).out, /note: \[\d+\] holds "ABC", not what was typed/)
+  assert.match((await run('type', 'Loose', 'x', '--enter')).out, /note: Enter changed nothing on the page/)
+})
+
+test('pick opens a custom dropdown and chooses its option by name', async () => {
+  await run('tab', `${base}/combo`)
+  assert.match((await run('pick', 'Plan', 'Pro')).out, /plan Pro/)
+  const none = await run('pick', 'Plan', 'Gold')
+  assert.equal(none.code, 1)
+  assert.match(none.out, /no option "Gold"; options: Free \| Pro \| Team/)
+})
+
+test('a ref the page re-rendered acts on the new element without looking again', async () => {
+  const page = await openRead(`${base}/rerender`)
+  const target = ref(page.out, /button "Target"/)
+  await run('click', ref(page.out, /button "Swap"/))
+  assert.match((await run('click', target)).out, /hit/)
 })

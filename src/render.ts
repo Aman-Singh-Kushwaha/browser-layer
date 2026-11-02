@@ -74,7 +74,12 @@ export function renderText(root: Node, origin: string, caps: Caps, seen?: Seen):
       flush()
       return
     }
-    // A collection or a canvas reads as its contents; its ref is for the map, `read` and `get`.
+    // A collection of records starts with its own line, so `get <ref>` is in reach from the text as from
+    // the map; then it reads as its contents, as a canvas does.
+    if (n.ref && COLLECTIONS.has(n.role ?? '') && !inRow) {
+      const rows = rowsOf(n).filter(r => !isHeaderRow(r)).length
+      if (rows >= 2) { flush(); lines.push(`[${n.ref}] ${n.role} of ${rows}`) }
+    }
     if (n.ref && !COLLECTIONS.has(n.role ?? '') && n.role !== 'canvas') {
       if (n.block && !inRow) flush()
       line += control(n, origin, caps)

@@ -15,8 +15,11 @@ const HELP = `browser-layer — websites as text and verbs for agents. <ref> is 
 
 Plain HTTP, no browser:  open <url>|<ref> · verbs · do <verb> k=v ... · --json
 Live tabs (headless browser, runs the page's JS):
-  tab <url>                    open a tab (current; an open page is switched to); answers with the map
+  tab <url> [url...]           open tabs, several side by side (an open page is switched to)
   go <url> · back · forward · reload · tabs · use <id> · close [id] · stop
+                               a page answers whole when short, else with its map
+  steps '<cmd>; <cmd>; ...'    several commands in one call: actions answer in one line, reads and
+                               the last step in full; the first error stops the rest
   map                          regions, fields, actions, lists and links, with refs
   read [ref] [--page N] [--full]   the page or one region; read again: what changed
   find <text> [--page N]       lines that contain it
@@ -138,9 +141,13 @@ function encode(verb: Verb, args: Record<string, string>): { method: string; bod
   return { method: 'POST', body: form }
 }
 
-async function main() {
-  const argv = process.argv.slice(2)
-  // Flags that carry a value: removed from argv, value returned.
+// Flags with no value, anywhere among a command's words.
+const FLAGS = new Set(['--json', '--enter', '--all', '--desc', '--gone', '--keys', '--full', '--urls'])
+
+// A command's words: flags that carry a value are taken out wherever they are, then the command, its target
+// and the rest are what is left.
+function parse(words: string[]) {
+  const argv = [...words]
   const take = (flag: string) => {
     const at = argv.indexOf(flag)
     if (at < 0) return undefined
@@ -160,16 +167,89 @@ async function main() {
   // The daemon runs elsewhere, so the file is resolved against the agent's working directory here.
   const out = take('--out')
   const file = out === undefined ? undefined : resolve(out)
-  session = take('--session') ?? session
-  // A profile is a separate browser: its own Chrome profile, cookies and daemon, under <home>/profiles.
+  const session = take('--session')
   const profile = take('--profile')
-  if (profile !== undefined) {
-    if (!/^[\w.-]+$/.test(profile)) fail('a profile name uses letters, digits, dot, dash or underscore')
-    process.env.BROWSER_LAYER_HOME = join(home(), 'profiles', profile)
+  const has = (flag: string) => argv.includes(flag)
+  const [cmd, target, ...rest] = argv.filter(a => !FLAGS.has(a))
+  return { cmd, target, rest, page, limit, sort, cols, file, session, profile, has }
+}
+
+// steps: commands separated by ; or a new line, each read as words the way a shell reads them ('…' and
+// "…" quote, \ escapes inside "…"). The text of each step is kept for its line in the answer.
+function script(text: string): { raw: string; words: string[] }[] {
+  const steps: { raw: string; words: string[] }[] = []
+  let words: string[] = [], word: string | undefined, quote = '', raw = ''
+  const end = () => { if (word !== undefined) words.push(word); word = undefined }
+  const close = () => { end(); if (words.length) steps.push({ raw: raw.trim(), words }); words = []; raw = '' }
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i]
+    if (quote) {
+      raw += ch
+      if (ch === quote) quote = ''
+      else if (ch === '\\' && quote === '"' && i + 1 < text.length) word = (word ?? '') + text[++i], raw += text[i]
+      else word = (word ?? '') + ch
+    } else if (ch === ';' || ch === '\n') close()
+    else {
+      raw += ch
+      if (ch === '"' || ch === "'") { quote = ch; word ??= '' }
+      else if (/\s/.test(ch)) end()
+      else word = (word ?? '') + ch
+    }
   }
-  const json = argv.includes('--json')
-  const flags = new Set(['--json', '--enter', '--all', '--desc', '--gone', '--keys', '--full', '--urls'])
-  const [cmd, target, ...rest] = argv.filter(a => !flags.has(a))
+  if (quote) fail(`steps: a ${quote} is not closed`)
+  close()
+  return steps
+}
+
+type Parsed = ReturnType<typeof parse>
+
+// A live-tab command from its parsed words.
+function liveCommand({ cmd, target, rest, page, limit, sort, cols, file, has }: Parsed): Command {
+  const c: Command = { cmd, session, page, limit, sort, cols, desc: has('--desc'), urls: has('--urls'), out: file, gone: has('--gone'), keys: has('--keys'), enter: has('--enter'), all: has('--all') }
+  if (cmd === 'tab' || cmd === 'go') c.url = target ?? fail(`usage: browser-layer ${cmd} <url>`)
+  if (cmd === 'tab' && rest.length) c.more = rest
+  if (cmd === 'use' || (cmd === 'close' && target)) c.id = Number(target)
+  if (cmd === 'net' && target) {
+    if (!['show', 'save'].includes(target) || !/^#?\d+$/.test(rest[0] ?? '') || (target === 'save' && !rest[1])) fail('usage: browser-layer net [--all] | net show <#> | net save <#> <file>')
+    c.id = Number(rest[0].replace('#', ''))
+    if (target === 'save') c.files = [resolve(rest[1])]
+  }
+  if (['click', 'dblclick', 'rightclick', 'hover', 'type', 'pick', 'upload', 'check', 'uncheck', 'submit', 'drag'].includes(cmd)) c.ref = target ?? fail(`usage: browser-layer ${cmd} <ref>`)
+  if (cmd === 'drag') c.to = rest[0] ?? fail('usage: browser-layer drag <ref> <onto ref>')
+  if (cmd === 'find') c.text = [target, ...rest].filter(Boolean).join(' ')
+  if (cmd === 'cookies') [c.dir, c.url] = target === 'clear' ? ['clear', rest[0]] : [undefined, target]
+  if (cmd === 'storage') [c.dir, c.text] = [target, rest[0]]
+  // The daemon runs elsewhere, so files are resolved against the agent's working directory here.
+  if (cmd === 'upload') c.files = rest.map(f => resolve(f))
+  if (cmd === 'screenshot') {
+    const [ref, file] = target && /^\d+$/.test(target) ? [target, rest[0]] : [undefined, target]
+    ;[c.ref, c.files, c.full] = [ref, [resolve(file ?? `screenshot-${Date.now()}.png`)], has('--full')]
+  }
+  if (cmd === 'scroll') [c.ref, c.dir] = target && /^\d+$/.test(target) ? [target, rest[0]] : [undefined, target]
+  if (cmd === 'dialog') [c.dir, c.text] = [target, rest.length ? rest.join(' ') : undefined]
+  if (cmd === 'wait' || cmd === 'eval') c.text = [target, ...rest].filter(Boolean).join(' ')
+  if (cmd === 'allow') [c.text, c.dir] = [target, rest[0]]
+  if (cmd === 'explore' && target) c.ref = /^\d+$/.test(target) ? target : fail('usage: browser-layer explore [ref]')
+  if (cmd === 'menu') c.text = [target, ...rest].filter(Boolean).join(' ')
+  if (cmd === 'read') c.full = has('--full')
+  if (cmd === 'read' && target) c.ref = /^\d+$/.test(target) ? target : fail('usage: browser-layer read [ref] [--page N]')
+  if (cmd === 'get') c.ref = target && /^\d+$/.test(target) ? target : fail('usage: browser-layer get <ref> [--sort col] [--desc] [--limit N] [--cols a,b] [--urls]')
+  if (cmd === 'type' || cmd === 'pick') c.text = rest.join(' ')
+  if (cmd === 'press') c.key = target ?? fail('usage: browser-layer press <key>')
+  return c
+}
+
+async function main() {
+  const parsed = parse(process.argv.slice(2))
+  const { cmd, target, rest, file } = parsed
+  session = parsed.session ?? session
+  // A profile is a separate browser: its own Chrome profile, cookies and daemon, under <home>/profiles.
+  if (parsed.profile !== undefined) {
+    if (!/^[\w.-]+$/.test(parsed.profile)) fail('a profile name uses letters, digits, dot, dash or underscore')
+    process.env.BROWSER_LAYER_HOME = join(home(), 'profiles', parsed.profile)
+  }
+  const json = parsed.has('--json')
+  const argv = process.argv.slice(2)
 
   if (cmd === '--version' || cmd === '-v' || cmd === 'version') return console.log(VERSION)
 
@@ -243,38 +323,23 @@ async function main() {
     return console.log("Saved. The agent's browser uses this session from the next command.")
   }
 
+  if (cmd === 'steps') {
+    const steps = script([target, ...rest].join(' ')).map(({ raw, words }) => {
+      const p = parse(words)
+      if (!LIVE.has(p.cmd) || p.cmd === 'stop' || p.session !== undefined || p.profile !== undefined) fail(`steps runs live-tab commands, without stop, --session or --profile: "${raw}"`)
+      return { ...liveCommand(p), raw }
+    })
+    if (!steps.length) fail(`usage: browser-layer steps 'type 14 "Mumbai"; press Enter; read'`)
+    const reply = await live({ cmd: 'steps', session, steps })
+    if (!reply.ok) fail(`error: ${reply.error}`)
+    console.log(reply.text)
+    // A step that failed stops a shell chain after this call too.
+    if (/\nstopped at step \d+ of \d+/.test(reply.text!)) process.exit(1)
+    return
+  }
+
   if (LIVE.has(cmd)) {
-    const c: Command = { cmd, session, page, limit, sort, cols, desc: argv.includes('--desc'), urls: argv.includes('--urls'), out: file, gone: argv.includes('--gone'), keys: argv.includes('--keys'), enter: argv.includes('--enter'), all: argv.includes('--all') }
-    if (cmd === 'tab' || cmd === 'go') c.url = target ?? fail(`usage: browser-layer ${cmd} <url>`)
-    if (cmd === 'use' || (cmd === 'close' && target)) c.id = Number(target)
-    if (cmd === 'net' && target) {
-      if (!['show', 'save'].includes(target) || !/^#?\d+$/.test(rest[0] ?? '') || (target === 'save' && !rest[1])) fail('usage: browser-layer net [--all] | net show <#> | net save <#> <file>')
-      c.id = Number(rest[0].replace('#', ''))
-      if (target === 'save') c.files = [resolve(rest[1])]
-    }
-    if (['click', 'dblclick', 'rightclick', 'hover', 'type', 'pick', 'upload', 'check', 'uncheck', 'submit', 'drag'].includes(cmd)) c.ref = target ?? fail(`usage: browser-layer ${cmd} <ref>`)
-    if (cmd === 'drag') c.to = rest[0] ?? fail('usage: browser-layer drag <ref> <onto ref>')
-    if (cmd === 'find') c.text = [target, ...rest].filter(Boolean).join(' ')
-    if (cmd === 'cookies') [c.dir, c.url] = target === 'clear' ? ['clear', rest[0]] : [undefined, target]
-    if (cmd === 'storage') [c.dir, c.text] = [target, rest[0]]
-    // The daemon runs elsewhere, so files are resolved against the agent's working directory here.
-    if (cmd === 'upload') c.files = rest.map(f => resolve(f))
-    if (cmd === 'screenshot') {
-      const [ref, file] = target && /^\d+$/.test(target) ? [target, rest[0]] : [undefined, target]
-      ;[c.ref, c.files, c.full] = [ref, [resolve(file ?? `screenshot-${Date.now()}.png`)], argv.includes('--full')]
-    }
-    if (cmd === 'scroll') [c.ref, c.dir] = target && /^\d+$/.test(target) ? [target, rest[0]] : [undefined, target]
-    if (cmd === 'dialog') [c.dir, c.text] = [target, rest.length ? rest.join(' ') : undefined]
-    if (cmd === 'wait' || cmd === 'eval') c.text = [target, ...rest].filter(Boolean).join(' ')
-    if (cmd === 'allow') [c.text, c.dir] = [target, rest[0]]
-    if (cmd === 'explore' && target) c.ref = /^\d+$/.test(target) ? target : fail('usage: browser-layer explore [ref]')
-    if (cmd === 'menu') c.text = [target, ...rest].filter(Boolean).join(' ')
-    if (cmd === 'read') c.full = argv.includes('--full')
-    if (cmd === 'read' && target) c.ref = /^\d+$/.test(target) ? target : fail('usage: browser-layer read [ref] [--page N]')
-    if (cmd === 'get') c.ref = target && /^\d+$/.test(target) ? target : fail('usage: browser-layer get <ref> [--sort col] [--desc] [--limit N] [--cols a,b] [--urls]')
-    if (cmd === 'type' || cmd === 'pick') c.text = rest.join(' ')
-    if (cmd === 'press') c.key = target ?? fail('usage: browser-layer press <key>')
-    const reply = await live(c)
+    const reply = await live(liveCommand(parsed))
     if (!reply.ok) fail(`error: ${reply.error}`)
     return console.log(reply.text)
   }

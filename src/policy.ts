@@ -5,10 +5,15 @@ import { home } from './session.js'
 // Every behavior tunable lives here; DESIGN.md §9 says what each one means.
 export const DEFAULTS = {
   'load.timeoutMs': 30000,
+  'load.domMs': 10000,
+  'load.retryMs': 8000,
   'viewport.width': 1280,
   'viewport.height': 900,
   'settle.quietMs': 400,
   'settle.deadlineMs': 5000,
+  'settle.revealMs': 2500,
+  'settle.thirdPartyMs': 1000,
+  'open.pageChars': 6000,
   'actions.timeoutMs': 5000,
   'command.timeoutMs': 75000,
   'read.timeoutMs': 20000,

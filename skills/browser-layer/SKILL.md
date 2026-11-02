@@ -23,35 +23,40 @@ text; never ask for pixels to understand it.
 Install once with `npm install -g browser-layer` (Node.js 22+); `browser-layer install` gets a
 browser if none is found. `browser-layer help` lists every command.
 
-## The loop
+## The loop: one call per decision
 
-1. `browser-layer tab <url>` opens a live tab and answers with the **map**: regions, fields,
-   actions, lists and links, each with a ref like `[15]`. Keep one tab open for each site the task uses
-   and switch between them with `use <id>`: each stays as you left it, nothing reloads (`tabs` lists
-   them). Move within a site with `go <url>`; `close` a tab you are done with.
+Work as a person at a browser does: look, decide, do everything you decided, look at the result.
+Every call costs you a turn, so make each call one decision, and come back only when the next step
+depends on something you cannot see yet.
+
+1. `browser-layer tab <url>` opens a page. A short page answers **whole**; a long one with its
+   **map**: regions, fields, actions, lists and links, each with a ref like `[15]`. Pages you already
+   know of open side by side in one call: `tab <url> <url> <url>`. Keep one tab per site and switch
+   with `use <id>` (nothing reloads; `tabs` lists them); move within a site with `go <url>`.
 2. Act on a ref or a control's name: `click 31`, `click "Next"`, `type 15 Mumbai --enter`,
-   `pick 22 "Economy"`, `check 40`.
-3. Every action answers with **what changed**, a new page's map, or the new records in a table.
-   That answer is the new state; reading the page again answers with what changed since your last
-   read.
+   `pick 22 "Economy"`, `check 40`. Every action answers with **what changed** or the new page, and
+   says when something did not take. That answer is the new state: no need to read again to check.
+3. **Do what you already know in one call** with `steps`: actions answer in one line, reads and the
+   last step in full, and the first error stops the rest and shows the page as it is then.
 4. Go deeper only where you need to: `read <ref>` for one region, `find <text>` for the lines that
    mention something, `get <ref>` for a list or table as records (`--urls` adds their addresses).
 
 ```text
-$ browser-layer tab shop.example.com/orders
+$ browser-layer tab shop.example.com
 [40] main
-  [52] table of 30: columns Order · Status · Total
-  actions: [61] button "Next" · [62] button "Export CSV"
-$ browser-layer get 52 --sort c3 --desc --limit 2
-c1 Order	c2 Status	c3 Total
-ORD-17	Paid	₹9,450
-ORD-04	Refunded	₹8,200
+  fields: [12] searchbox "Search"
+  actions: [13] button "Search"
+$ browser-layer steps 'type 12 "desk lamp" --enter; pick "Sort" "Price: low to high"; get 52 --limit 3'
+1. type 12 "desk lamp" --enter  → tab 1  https://shop.example.com/s?q=desk+lamp — the whole page changed
+2. pick "Sort" "Price: low to high"  → tab 1  https://shop.example.com/s?q=desk+lamp&sort=price — 30 lines gone, 30 new
+3. get 52 --limit 3
+[52] list: 48 records, 3 columns (first 3)
+c1 Name	c2 Price	c3 Rating
+Clip lamp	₹499	4.1
 ```
 
 ## Habits
 
-- Chain known steps in one call: `type 7 550000 >/dev/null && click 27`. Only the last answer
-  needs reading; a failure still shows.
 - Put filters in the URL when the site does (`?q=python&page=2`); `wait "<text>"` when content loads
   late; `open <url>` for a static page that needs no JavaScript.
 - The data usually comes from an API: `net` lists the calls, `net show <#>` previews one,
@@ -61,9 +66,10 @@ ORD-04	Refunded	₹8,200
   hits.txt`, `read --out page.txt`; then `grep`, `jq` or a script.
 - A list is complete only when you can show it ended: the site's total matches, the last page has
   no Next, or `scroll` brings nothing new three times. Until then say how many of how many.
-- After a filter or search, check that the results, their count or the URL changed. When the site
-  drops a setting you were given, set it another way (its own controls, the URL as it writes it).
-  Add no filters of your own.
+- After a filter or search, its answer shows whether the results, their count or the URL changed.
+  When the site drops a setting you were given, set it another way (its own controls, the URL as it
+  writes it). Add no filters of your own.
+- Follow the site's links and its own search rather than guessing deep URLs.
 - **Deliver as you go.** Write the deliverable itself early and update it with each finding, so
   stopping at any moment still leaves your best result. Mark what you have not checked as
   unchecked; never fill it in.
@@ -76,8 +82,10 @@ ORD-04	Refunded	₹8,200
   often covers one page: try the site's home page or search, another URL for the same content, its
   API or sitemap, or another source. If it stays blocked, a person can clear it: `browser-layer show`,
   then `hide`. Report what you could not reach as unavailable, never as empty.
-- `covered by <div> "…"` — a pop-up is over the control: close it with its own button or
-  `press Escape`.
+- `covered by <div> "…"; its controls: "Reject all" · …` — a pop-up is over the control: answer it
+  and go on in one call, `steps 'click "Reject all"; click 31'`, or `press Escape`.
+- `note: …` — something did not take (a field holds other text, Enter did nothing): act on it
+  directly, such as clicking the form's own button.
 - A page whose content is pictures (a scanned book, a map, a video) or that asks you to turn off an
   ad blocker: `allow images`, then `reload`.
 
