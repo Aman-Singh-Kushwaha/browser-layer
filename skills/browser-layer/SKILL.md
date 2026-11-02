@@ -29,10 +29,10 @@ Work as a person at a browser does: look, decide, do everything you decided, loo
 Every call costs you a turn, so make each call one decision, and come back only when the next step
 depends on something you cannot see yet.
 
-1. `browser-layer tab <url>` opens a page. A short page answers **whole**; a long one with its
-   **map**: regions, fields, actions, lists and links, each with a ref like `[15]`. Pages you already
-   know of open side by side in one call: `tab <url> <url> <url>`. Keep one tab per site and switch
-   with `use <id>` (nothing reloads; `tabs` lists them); move within a site with `go <url>`.
+1. `browser-layer tab <url>` opens a page and answers with its **map**: regions, fields, actions,
+   lists and links, each with a ref like `[15]`. Need its text too? `tab <url> && browser-layer read`
+   in the same call. Keep one tab per site and switch with `use <id>` (nothing reloads; `tabs` lists
+   them); move within a site with `go <url>`.
 2. Act on a ref or a control's name: `click 31`, `click "Next"`, `type 15 Mumbai --enter`,
    `pick 22 "Economy"`, `check 40`. Every action answers with **what changed** or the new page, with
    the refs of anything it opened (options, a dialog, a date grid), and says when something did not

@@ -44,7 +44,7 @@ headings and fields, walk a list item by item, and act. It rests on standards ev
 
 | Move | What the agent gets | Command |
 |---|---|---|
-| **Map** | The page as regions, each with its fields (and values), options, actions, headings, collections (record count and first item, or a table's columns) and links; named when few, counted when many. Opening a page answers with its whole text when that fits `open.pageChars`, else with the map. | `tab`, `go`, `map` |
+| **Map** | The page as regions, each with its fields (and values), options, actions, headings, collections (record count and first item, or a table's columns) and links; named when few, counted when many. Opening a page answers with the map. | `tab`, `go`, `map` |
 | **Zoom** | One region, collection or control in full text. | `read <ref>` |
 | **Whole page** | Everything, paged. Read again, only what changed since the last read (`--full`: all of it). | `read` |
 | **Act** | Fill, pick, click by ref; the answer is what changed (§4.4). | `type`, `pick`, `click`, `press` |
@@ -61,13 +61,13 @@ unchanged`. Its ref still works (refs stay with the element, §3), and `read <re
 `map` show it whole.
 
 **One call per decision.** Every call is a turn of the agent's model, and the turns, not the browser,
-take most of a task's time. So an answer carries what the next decision needs: a short page opens whole
-(reading it next says nothing changed), an action says what did not take (a field holding other text,
+take most of a task's time. So an answer carries what the next decision needs: an action that opens a
+dialog answers with what it holds when short (`open.dialogChars`), an action says what did not take (a field holding other text,
 an Enter that changed nothing, what covers a control and the buttons that answer it), a ref the page
 re-rendered acts on the same element without a second look, and a 429 is waited out and loaded again.
 What the agent already knows it does in one call: `steps` runs several commands in order, actions
 answering in one line, reads and the last step in full, stopping at the first error, dialog or block with
-the page as it is then; `tab` with several URLs loads them side by side.
+the page as it is then.
 
 ## 2. Evidence this design rests on
 
@@ -199,7 +199,7 @@ the shorter of its whole text (a small page) and its map (a large one). A map sh
 shape, which new records (the next page of a table) leave as it was, so such an answer is those
 records, as `get` gives them, plus any other new lines; more than one page of them gets the map,
 naming where they are (`new records in [12] table`). A new document
-(`Page.frameNavigated` on the main frame) answers as an opened page does: whole when short, else the map. pushState and hash changes are the same
+(`Page.frameNavigated` on the main frame) gets the map. pushState and hash changes are the same
 document: refs and the view stay valid. A dialog, a pop-up and finished downloads are reported first.
 Changed lines longer than one page with a long list among them (a menu of every language) give that
 list as one line, as the map does: its size and first items; `find` or `read <ref>` goes in.
@@ -265,9 +265,11 @@ Settled when the site's own requests the command caused have finished and the sh
 or at `settle.deadlineMs`. Every answer says which (`idle in 412 ms`, `deadline 5000 ms`). The agent reads
 text, so text is what settle waits on: ads, timers and animations change the DOM all the time without
 changing a word. Another site's requests (ads, analytics, widgets; a site is its registrable domain) do not
-hold a page, except the fetch/XHR calls an action on a loaded page starts within `settle.thirdPartyMs` (a
-search box served by a search API). Measured on news, travel and retail home pages: BBC 3.2 s → 1.2 s,
-Booking and CNN from the 5 s deadline to 1.6 s and 2.3 s. A page with plenty of text but hardly any shown
+hold a page, except their fetch/XHR calls where content may come from them: those an action on a loaded
+page starts within `settle.thirdPartyMs` (a search box served by a search API), and those a page that just
+arrived makes in its first `settle.arrivalMs`, each for that long at most (results from another site's API;
+ad scripts keep making more, so each is bounded). Measured on news, travel and retail home pages: BBC 3.2 s → 2.7 s,
+CNN from the 5 s deadline to 4.4 s, Zillow 2.9 s → 2.1 s, Stack Overflow 1.5 s → 1.9 s. A page with plenty of text but hardly any shown
 (results revealed after load) gets `settle.revealMs` to show it. A document that has not arrived in
 `load.domMs` is read as far as it got, and the answer says so. The page's standing connections are not the command's doing: requests open
 when it began, and requests that reopen one of their channels (same origin and path, as a long-poll
@@ -278,7 +280,7 @@ always open: actions settle in 0.4–1.4 s instead of the 5 s deadline.
 
 | Capability | Commands |
 |---|---|
-| Navigation | `tab <url> [url…]` (several load side by side; a page already open in the session switches to its tab), `go <url>`, `back`, `forward`, `reload`, `tabs` (by last use), `use`, `close` |
+| Navigation | `tab <url>` (a page already open in the session switches to its tab), `go <url>`, `back`, `forward`, `reload`, `tabs` (by last use), `use`, `close` |
 | Reading | `map`, `read [ref] [--page N]`, `find <text>`, `get <ref>` (records), `wait [--gone] <text>` |
 | Menus | `explore [ref]`, `menu "A > B > C"` |
 | Pointer | `click`, `dblclick`, `rightclick`, `hover`, `drag <ref> <onto ref>` (pointer drags and HTML drag and drop) |
@@ -320,7 +322,8 @@ Keys are added when the phase that uses them lands.
 | `settle.deadlineMs` | 5000 | Max wait after an action |
 | `settle.revealMs` | 2500 | Wait for text a page holds but does not show yet |
 | `settle.thirdPartyMs` | 1000 | Another site's fetch/XHR started this soon after an action on a loaded page holds settle |
-| `open.pageChars` | 6000 | A page this short or shorter (regions already shown, one line each) answers whole when it arrives |
+| `settle.arrivalMs` | 2000 | On a page that just arrived, another site's fetch/XHR started in this window holds settle, each for this long at most |
+| `open.dialogChars` | 6000 | A dialog an action opened answers whole up to this size (regions already shown, one line each), else with its map |
 | `render.pageChars` | 15000 | Text page size |
 | `render.maxChars` | 400000 | Ceiling on one snapshot |
 | `render.nameChars` | 120 | Cap for names that are on screen, and link paths |

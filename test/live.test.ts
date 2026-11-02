@@ -136,6 +136,9 @@ const server = createServer((req, res) => {
   // Another site's request that never finishes (an ad server) beside the site's own data call.
   if (req.url === '/thirdparty') return page('thirdparty', `<p id="o">loading</p><script>fetch('http://localhost:${port}/hang').catch(() => {})
     fetch('/slow').then(r => r.text()).then(t => o.textContent = 'own data: ' + t)</script>`)
+  // Results served by another site's API a moment after the page loads.
+  if (req.url === '/listing') return page('listing', `<p id="o">loading results</p><script>fetch('http://localhost:${port}/slow-api').then(r => r.text()).then(t => o.textContent = 'results: ' + t)</script>`)
+  if (req.url === '/slow-api') { res.setHeader('access-control-allow-origin', '*'); return void setTimeout(() => res.end('slow data'), 800) }
   if (req.url === '/hang') return
   // Too many requests once, then the page.
   if (req.url === '/busy-site') {
@@ -162,6 +165,12 @@ const server = createServer((req, res) => {
     <div role="combobox" aria-label="Trip" aria-expanded="false" tabindex="0" id="c" onclick="opened()">Round trip</div>
     <div role="listbox" id="l" hidden><div role="option">Round trip</div><div role="option" onclick="o.textContent = 'trip One way'; l.hidden = true">One way</div></div><p id="o">trip Round trip</p></main>
     <script>function opened() { l.hidden = false; c.setAttribute('aria-expanded', 'true'); document.querySelectorAll('a, li span').forEach(e => e.textContent = 'City image for ' + e.textContent) }</script>`)
+  // A date picker whose days are labelled cells clicked through one listener at the root (as React does),
+  // beside a data grid whose cells are named by what they show.
+  if (req.url === '/datepicker') return page('datepicker', `<input aria-label="Date of birth" onclick="d.hidden = false"><p id="o">none</p>
+    <div id="d" role="dialog" aria-label="Choose Date" hidden><div role="grid">${[0, 1].map(w => `<div role="row">${Array.from({ length: 7 }, (_, k) => w * 7 + k + 9).map(n => `<div role="gridcell" tabindex="-1" aria-label="Choose March ${n}th, 1998">${n}</div>`).join('')}</div>`).join('')}</div></div>
+    <div role="grid" aria-label="Scores"><div role="row"><div role="gridcell">Asha</div><div role="gridcell">91</div></div><div role="row"><div role="gridcell">Ravi</div><div role="gridcell">84</div></div></div>
+    <script>document.addEventListener('click', e => { const c = e.target.closest('[aria-label^=Choose]'); if (c) { o.textContent = 'picked ' + c.textContent; d.hidden = true } })</script>`)
   const results = req.url?.match(/^\/results\/(\d)$/)
   if (results) return page(`results ${results[1]}`, `<header><a href="/">Home</a> <a href="/deals">Deals</a> <a href="/help">Help</a><p>Free delivery on every order</p></header><main><p>Page ${results[1]}</p>${'<button>Add to cart</button>'.repeat(+results[1])}</main><nav aria-label="Pagination"><a href="/results/${+results[1] + 1}">Next</a></nav>`)
   // A page laid out as three same-looking columns, each holding a region (a web app's shell): layout, not records.
@@ -307,8 +316,8 @@ const run = (...args: string[]) => runIn(home, ...args)
 const killByArgument = (arg: string) => new Promise(r => (process.platform === 'win32'
   ? execFile('powershell', ['-NoProfile', '-Command', `Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like '*${arg.replace(/'/g, "''")}*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }`], r)
   : execFile('pkill', ['-f', arg], r)))
-// Opening answers with the page, or its map when long; these tests check page content, so they read it whole.
-const openRead = async (url: string) => { await run('tab', url); return run('read', '--full') }
+// Opening answers with the map; these tests check page content, so they read the whole page next.
+const openRead = async (url: string) => { await run('tab', url); return run('read') }
 
 const ref = (out: string, what: RegExp) => {
   const m = out.match(new RegExp(`\\[(\\d+)\\] ${what.source}`))
@@ -367,8 +376,8 @@ test('sessions keep their own tabs and cannot touch each other', async () => {
   const a = await run('--session', 'a', 'tab', `${base}/page/alpha`)
   await run('--session', 'b', 'tab', `${base}/page/beta`)
   const aId = a.out.match(/^tab (\d+)/)![1]
-  assert.match(a.out, /page alpha/)
-  assert.match((await run('--session', 'b', 'read', '--full')).out, /page beta/)
+  assert.match((await run('--session', 'a', 'read')).out, /page alpha/)
+  assert.match((await run('--session', 'b', 'read')).out, /page beta/)
   assert.doesNotMatch((await run('--session', 'b', 'tabs')).out, /alpha/)
   const r = await run('--session', 'b', 'use', aId)
   assert.equal(r.code, 1)
@@ -403,9 +412,8 @@ test('the live view: one line per row, aria-hidden text without refs, hidden lab
   assert.ok(label && label[1].length === DEFAULTS['render.labelChars'] && label[1].endsWith('…'), out)
 })
 
-test('a page shows as a map of regions; read <ref> opens one region', async () => {
-  await run('tab', `${base}/regions`)
-  const map = await run('map')
+test('a page opens as a map of regions; read <ref> opens one region', async () => {
+  const map = await run('tab', `${base}/regions`)
   assert.match(map.out, /^\[\d+\] navigation "Main"\n  links: \[\d+\] link "Home" · \[\d+\] link "About"$/m)
   assert.match(map.out, /^\[\d+\] search\n  fields: \[\d+\] searchbox "Search flights"\n  actions: \[\d+\] button "Go"$/m)
   assert.match(map.out, /^\[\d+\] main\n  headings: Results\n  \[\d+\] list of 12: • Flight 0 · ₹100 …$/m)
@@ -416,8 +424,7 @@ test('a page shows as a map of regions; read <ref> opens one region', async () =
 })
 
 test('get turns a list or table into records that line up, sort as numbers, and limit', async () => {
-  await run('tab', `${base}/data`)
-  const map = await run('map')
+  const map = await run('tab', `${base}/data`)
   const list = ref(map.out, /list of 4/)
   const table = ref(map.out, /table of 2: columns Name · Size/)
   const all = await run('get', list)
@@ -506,9 +513,11 @@ test('get --urls gives each record its links and pictures, each address once; pl
 })
 
 test('images are not loaded until the agent allows them for a site', async () => {
-  assert.match((await run('tab', `${base}/pictured`)).out, /image missing/)
+  await run('tab', `${base}/pictured`)
+  assert.match((await run('read')).out, /image missing/)
   assert.match((await run('allow', 'images')).out, /allowed images for http:\/\/127\.0\.0\.1:\d+ \(reload to load them\)/)
-  assert.match((await run('reload')).out, /image loaded/)
+  await run('reload')
+  assert.match((await run('read')).out, /image loaded/)
 })
 
 test('a whole-page screenshot taller than Chrome can capture stops at the limit and says so', async () => {
@@ -537,14 +546,13 @@ test('screenshot saves a PNG of the tab: the visible part, the whole page, or on
 })
 
 test('repeated cards without list markup are records; repeated paragraphs are not', async () => {
-  await run('tab', `${base}/cards`)
-  const map = await run('map')
+  const map = await run('tab', `${base}/cards`)
   assert.match(map.out, /\[\d+\] list of 4: /)
   assert.doesNotMatch(map.out, /list of 5/)
   const cheap = await run('get', ref(map.out, /list of 4/), '--sort', 'c2', '--limit', '2')
   assert.match(cheap.out, /^c1\tc2\nAcer Aspire\t₹32,990\nDell 14\t₹41,500$/m)
   // The page reads as before: a detected collection does not turn cards into single lines.
-  assert.match((await run('read', '--full')).out, /^### Acer Aspire\n₹32,990$/m)
+  assert.match((await run('read')).out, /^### Acer Aspire\n₹32,990$/m)
 })
 
 test('reading never changes the page', async () => {
@@ -565,7 +573,7 @@ test('actions answer with what changed; a new page answers with its map', async 
   assert.match((await run('read', '--full')).out, /story 5[\s\S]*loaded more/)
   const next = await run('click', ref(full.out, /link "next page"/))
   assert.match(next.out, /^tab \d+ .*\/page\/next/)
-  assert.match(next.out, /— the whole page/)
+  assert.match(next.out, /read <ref> opens a region/)
 })
 
 test('a pushState URL change keeps refs and answers with changes', async () => {
@@ -602,13 +610,14 @@ test('long views come in pages and every page is reachable', async () => {
 test('a home dir deeper than the socket path limit still starts the daemon', async () => {
   mkdirSync(deepHome, { recursive: true })
   assert.equal((await runIn(deepHome, 'tab', `${base}/page/deep`)).code, 0)
-  const r = await runIn(deepHome, 'read', '--full')
+  const r = await runIn(deepHome, 'read')
   assert.equal(r.code, 0, r.out)
   assert.match(r.out, /page deep/)
 })
 
 test('reads and acts inside same-origin and cross-origin iframes', async () => {
-  const all = await run('tab', `${base}/frames`)
+  await run('tab', `${base}/frames`)
+  const all = await run('read')
   assert.match(all.out, /button "Same button"/)
   assert.match(all.out, /textbox "Card number"/)
   await run('type', ref(all.out, /textbox "Card number"/), '4242')
@@ -651,7 +660,7 @@ test('a pop-up opens as a tab in the same session and becomes current', async ()
   const r = await run('click', ref(page.out, /link "open help"/))
   assert.match(r.out, /opened tab \d+ \(a pop-up of tab \d+\); it is now current/)
   assert.match(r.out, /\/page\/popped/)
-  assert.match(r.out, /page popped/)
+  assert.match((await run('read')).out, /page popped/)
 })
 
 test('downloads are saved and reported; uploads go through inputs and file choosers', async () => {
@@ -709,7 +718,8 @@ test('a result bigger than one answer goes whole to a file with --out; find page
 })
 
 test('reading a page again answers with what changed since the last read; --full gives it all', async () => {
-  assert.match((await run('tab', `${base}/counter`)).out, /count 0/)
+  await run('tab', `${base}/counter`)
+  assert.match((await run('read')).out, /count 0/)
   assert.match((await run('read')).out, /— no change since your last read \(read --full shows it again\)/)
   await run('click', 'Add')
   const again = (await run('read')).out
@@ -742,13 +752,13 @@ test('a region already shown, unchanged, is one line on the next page; read --fu
   await run('stop')
   const first = (await run('tab', `${base}/results/1`)).out
   const banner = ref(first, /banner/)
-  assert.match(first, /link "Deals"/)
+  assert.match(first, /links: .*"Deals"/)
   const second = (await run('click', 'Next')).out
   assert.match(second, new RegExp(`\\[${banner}\\] banner — shown before, unchanged`))
   assert.doesNotMatch(second, /"Deals"/)
-  // What the next page showed is what the agent has: reading it again adds nothing.
-  assert.match((await run('read')).out, /no change since your last read/)
-  const third = (await run('click', 'Next')).out
+  assert.match((await run('read')).out, /Free delivery/)
+  await run('click', 'Next')
+  const third = (await run('read')).out
   assert.match(third, new RegExp(`\\[${banner}\\] banner — shown before, unchanged`))
   assert.match(third, /Page 3/)
   assert.doesNotMatch(third, /Free delivery/)
@@ -788,8 +798,7 @@ test('the same element on the next page keeps its ref; one that is no longer uni
 })
 
 test('columns that hold parts of the page are layout, not records; cards that hold a form are records', async () => {
-  await run('tab', `${base}/shell`)
-  const map = (await run('map')).out
+  const map = (await run('tab', `${base}/shell`)).out
   assert.equal(map.match(/list of 3/g)?.length, 1)
   assert.match(map, /list of 3: ### Lamp/)
 })
@@ -831,7 +840,7 @@ test('a session saved by a normal browser window on the agent profile carries in
   await (await browser.newBrowserCDPSession()).send('Browser.close').catch(() => {})
   await new Promise(r => chrome.on('exit', r))
   await runIn(dir, 'tab', `${base}/who`)
-  assert.match((await runIn(dir, 'read', '--full')).out, /who: signed in/)
+  assert.match((await runIn(dir, 'read')).out, /who: signed in/)
   await runIn(dir, 'stop')
   rmSync(dir, { recursive: true, force: true })
 })
@@ -861,7 +870,7 @@ test('when the browser goes away (window closed, crash), the next command starts
   await new Promise(r => setTimeout(r, 1500))
   const again = await runIn(dir, 'tab', `${base}/page/two`)
   assert.equal(again.code, 0, again.out)
-  assert.match(again.out, /page two/)
+  assert.match((await runIn(dir, 'read')).out, /page two/)
   await runIn(dir, 'stop')
   rmSync(dir, { recursive: true, force: true })
 })
@@ -876,9 +885,9 @@ test('controls say what they reveal and whether they react to hover, before any 
 })
 
 test('text drawn on a canvas reads as lines, and text painted over is forgotten', async () => {
-  const out = (await run('tab', `${base}/canvas`)).out
-  const map = (await run('map')).out
+  const map = (await run('tab', `${base}/canvas`)).out
   assert.match(map, /\[\d+\] canvas: 2 lines — Name · Price …/)
+  const out = (await run('read')).out
   assert.match(out, /^Name · Price\nTea · ₹40$/m)
   assert.doesNotMatch(out, /stale/)
   const rows = await run('get', ref(map, /canvas: 2 lines/), '--sort', 'c1', '--desc')
@@ -887,8 +896,7 @@ test('text drawn on a canvas reads as lines, and text painted over is forgotten'
 })
 
 test('explore opens every declared menu, reads it, closes it, and never runs a command', async () => {
-  await run('tab', `${base}/menus`)
-  const map = (await run('map')).out
+  const map = (await run('tab', `${base}/menus`)).out
   assert.match(map, /closed menus and pop-ups: 2 \(browser-layer explore lists what they hold\)/)
   const out = (await run('explore')).out
   assert.match(out, /2 declared menus and pop-ups, each opened, read and closed/)
@@ -1009,38 +1017,26 @@ test('stale refs and missing tabs fail with a clear message', async () => {
 
 test('another site\'s requests do not hold a page; the site\'s own data call does', async () => {
   const t0 = Date.now()
-  const r = await run('tab', `${base}/thirdparty`)
-  assert.match(r.out, /own data: slow data/)
+  await run('tab', `${base}/thirdparty`)
+  assert.match((await run('read')).out, /own data: slow data/)
   assert.ok(Date.now() - t0 < 6000, `took ${Date.now() - t0} ms`)
-})
-
-test('a short page answers whole when opened, and reading it next says nothing changed', async () => {
-  const r = await run('tab', `${base}/page/whole`)
-  assert.match(r.out, /— the whole page/)
-  assert.match(r.out, /page whole/)
-  assert.match((await run('read')).out, /no change since your last read/)
 })
 
 test('too many requests (429) waits as the site asks and loads the page again', async () => {
   const r = await run('tab', `${base}/busy-site`)
   assert.match(r.out, /HTTP 429\); loaded again after 1 s/)
-  assert.match(r.out, /served after the wait/)
+  assert.match((await run('read')).out, /served after the wait/)
 })
 
 test('text already in the page but shown a moment later is waited for', async () => {
-  assert.match((await run('tab', `${base}/shown-late`)).out, /Result 59/)
+  await run('tab', `${base}/shown-late`)
+  assert.match((await run('read')).out, /Result 59/)
 })
 
 test('a document whose end is slow to arrive is read as far as it got', async () => {
   const r = await run('tab', `${base}/slowdoc`)
-  assert.match(r.out, /still loading after 2 s/)
-  assert.match(r.out, /first part/)
-})
-
-test('several pages open side by side in one call; the last is current', async () => {
-  const r = await run('tab', `${base}/page/one`, `${base}/page/two`)
-  assert.match(r.out, /page one[\s\S]*page two/)
-  assert.match((await run('tabs')).out, /^\* \d+ +\S+\/page\/two/m)
+  assert.match(r.out, /settled: still loading after 2 s/)
+  assert.match((await run('read')).out, /first part/)
 })
 
 test('steps runs several commands in one call: actions in one line, reads and the last in full', async () => {
@@ -1080,7 +1076,8 @@ test('pick opens a custom dropdown and chooses its option by name', async () => 
 })
 
 test('a ref the page re-rendered acts on the new element without looking again', async () => {
-  const page = await openRead(`${base}/rerender`)
+  await run('tab', `${base}/rerender`)
+  const page = await run('read', '--full')
   const target = ref(page.out, /button "Target"/)
   await run('click', ref(page.out, /button "Swap"/))
   assert.match((await run('click', target)).out, /hit/)
@@ -1093,4 +1090,17 @@ test('an action the page re-renders around answers with the map, listing what op
   assert.match(r.out, /^\+ \[\d+\] option "One way"$/m)
   assert.doesNotMatch(r.out, /records|City image/)
   assert.match((await run('pick', 'Trip', 'One way')).out, /trip One way/)
+})
+
+test('a date picker\'s labelled days are controls to click by name; a data grid\'s cells stay content', async () => {
+  const page = await run('tab', `${base}/datepicker`)
+  assert.doesNotMatch(page.out, /gridcell "Asha"|gridcell "91"/)
+  const open = await run('click', 'Date of birth')
+  assert.match(open.out, /\[\d+\] gridcell "Choose March 15th, 1998"/)
+  assert.match((await run('click', 'March 15th')).out, /picked 15/)
+})
+
+test('results a page loads from another site\'s API as it arrives are waited for', async () => {
+  // In one call, so nothing between the page's arrival and the look at it gives the API time it was not waited for.
+  assert.match((await run('steps', `tab ${base}/listing; find "results:"`)).out, /results: slow data/)
 })

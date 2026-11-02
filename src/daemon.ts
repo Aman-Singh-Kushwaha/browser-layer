@@ -141,18 +141,19 @@ type Tab = {
   used: number
   pending: Map<Request, number>; standing: Set<string>; net: Req[]; netId: number; frames: Map<string, Frame>; dialog?: Dialog; opened: number[]
   downloads: { file: string; size: number; url: string }[]; saving: Promise<void>[]; status?: number; retryAfter?: string
-  // The document the current command began on: another site's data calls count only on that one.
-  startDoc?: number
+  // The document the current command began on, and when a new one arrived during it: which of another
+  // site's data calls count (caused).
+  startDoc?: number; arrived?: number
 }
 export type Command = {
   cmd: string; session: string; urls?: boolean; out?: string; url?: string; ref?: string; text?: string; key?: string; id?: number; enter?: boolean; all?: boolean
   page?: number; files?: string[]; dir?: string; gone?: boolean; keys?: boolean; to?: string; full?: boolean; version?: string
-  // tab: more pages to open beside the first. steps: the commands to run, each with the text it was given as.
-  more?: string[]; steps?: Command[]; raw?: string
+  // steps: the commands to run, each with the text it was given as.
+  steps?: Command[]; raw?: string
 } & Query
 
-// Commands that only read the current page, for the shorter time limit.
-const READS = new Set(['read', 'map', 'find', 'get', 'screenshot', 'net', 'tabs', 'cookies', 'storage'])
+// Commands that only read a page (use reads the tab it switches to), for the shorter time limit.
+const READS = new Set(['read', 'map', 'find', 'get', 'screenshot', 'net', 'tabs', 'cookies', 'storage', 'use'])
 
 // Tab ids are unique across the daemon; each session (one agent, one task) has its own current tab.
 const tabs = new Map<number, Tab>()
@@ -228,6 +229,7 @@ function beginCommand() {
   for (const t of tabs.values()) {
     t.standing = new Set([...t.pending.keys()].map(r => channel(r.url())))
     t.startDoc = t.doc
+    t.arrived = undefined
   }
 }
 // A site is its registrable domain: news.example.co.uk and static.example.co.uk are one site. Two-letter
@@ -242,14 +244,18 @@ const registrable = (url: string) => {
 }
 // Requests the current command caused that are still in flight and that the page's content waits on: the
 // site's own. Another site's requests (ads, analytics, widgets) keep a page busy for seconds and change
-// nothing the agent reads, except the data calls an action on a loaded page starts right away (a search
-// box served by a search API), which count on that page.
+// nothing the agent reads, so only its data calls (fetch, XHR) count, and only where content may come from
+// them: on a loaded page, those an action starts right away (a search box served by a search API); on a
+// page that just arrived, those its scripts make in its first settle.arrivalMs, each for that long at most,
+// since ad scripts keep making more (results served by another site's API).
 const caused = (tab: Tab) => {
   const site = registrable(tab.page.url())
   return [...tab.pending].filter(([r, at]) => {
     if (at < commandStart || tab.standing.has(channel(r.url())) || r.resourceType() === 'eventsource' || isTracker(r.url())) return false
     if (registrable(r.url()) === site) return true
-    return tab.doc === tab.startDoc && (r.resourceType() === 'xhr' || r.resourceType() === 'fetch') && at - commandStart < policy['settle.thirdPartyMs']
+    if (r.resourceType() !== 'xhr' && r.resourceType() !== 'fetch') return false
+    if (tab.doc === tab.startDoc) return at - commandStart < policy['settle.thirdPartyMs']
+    return tab.arrived !== undefined && at - tab.arrived < policy['settle.arrivalMs'] && Date.now() - at < policy['settle.arrivalMs']
   }).length
 }
 
@@ -261,6 +267,7 @@ async function settle(tab: Tab, deadline = policy['settle.deadlineMs']): Promise
   const start = Date.now()
   const arrived = await tab.page.waitForLoadState('domcontentloaded', { timeout: policy['load.domMs'] }).then(() => true, () => false)
   if (!arrived) return `still loading after ${policy['load.domMs'] / 1000} s; this is what has arrived`
+  if (tab.doc !== tab.startDoc) tab.arrived ??= Date.now()
   const end = Date.now() + deadline
   let last: unknown
   let hidden: boolean | undefined
@@ -313,8 +320,20 @@ const header = async (tab: Tab) => {
 // The agent never solves or evades either (DESIGN §1: no anti-bot evasion), but a block often covers one
 // page and not the site: the normal way in (home page, the site's own search, another page, a retry after
 // a wait) is tried first, and a person can clear it in the window.
-function blocked(tab: Tab, tree: Node): string {
-  const check = humanCheck(tab.page.frames().map(f => f.url()), tree, policy['blocked.controls'])
+// A check provider's frame is a check only when a person can see it: reCAPTCHA's invisible helper frames
+// (which ad scripts load on ordinary pages) are hidden or have no size, while a checkbox or a challenge is
+// a box on the page.
+const SHOWN_PX = 30
+async function shownFrames(tab: Tab): Promise<string[]> {
+  const shown = await Promise.all(tab.page.frames().filter(f => f !== tab.page.mainFrame()).map(async f => {
+    const box = await f.frameElement().then(e => e.boundingBox()).catch(() => null)
+    return box && box.width >= SHOWN_PX && box.height >= SHOWN_PX ? f.url() : undefined
+  }))
+  return shown.filter((u): u is string => u !== undefined)
+}
+
+async function blocked(tab: Tab, tree: Node): Promise<string> {
+  const check = humanCheck(await shownFrames(tab), tree, policy['blocked.controls'])
   if (!check && tab.status !== 403 && tab.status !== 429) return ''
   const why = check ? 'a human check (CAPTCHA) is on this page' : `the site refused this browser (HTTP ${tab.status})`
   return `\nblocked: ${why}. Do not solve or evade the check. Try another normal way in first: the site's home page or its own search, a different page of the site, or this page again after a short wait. If it stays blocked, a person can clear it: browser-layer show, clear it in that window, then browser-layer hide\n`
@@ -329,20 +348,19 @@ async function mapView(tab: Tab, snap?: Awaited<ReturnType<typeof snapshot>>, se
   const now = new Map<number, string>()
   const map = renderMap(tree, origin, caps(), policy['render.mapFew'], { before: whole ? new Map() : tab.seen.map, now })
   for (const [ref, whole] of now) tab.seen.map.set(ref, whole)
-  return `${await header(tab)}${note ? `  — ${note}` : ''}${settled ? `  — settled: ${settled}` : ''}\n${blocked(tab, tree)}\n${map}\n\n(read <ref> opens a region · read gives the whole page)`
+  return `${await header(tab)}${note ? `  — ${note}` : ''}${settled ? `  — settled: ${settled}` : ''}\n${await blocked(tab, tree)}\n${map}\n\n(read <ref> opens a region · read gives the whole page)`
 }
 
-// A page just arrived, as a person takes it in: a short one whole (regions already shown, unchanged, one
-// line each), so reading it is not a second call; a long one as its map.
-async function pageView(tab: Tab, snap?: Awaited<ReturnType<typeof snapshot>>, settled = '', note = ''): Promise<string> {
-  snap ??= await snapshot(tab)
+// A dialog an action opened (a date picker, a list of suggestions) answers with what it holds when that is
+// short, refs included, so the next step can act on it without reading it first; a long one, with its map.
+async function openedView(tab: Tab, snap: Awaited<ReturnType<typeof snapshot>>, settled = ''): Promise<string> {
   const now = new Map<number, string>()
   const short = renderText(snap.tree, snap.origin, caps(), { before: tab.seen.text, now })
-  if (short.length > policy['open.pageChars']) return mapView(tab, snap, settled, note)
+  if (short.length > policy['open.dialogChars']) return mapView(tab, snap, settled)
   remember(tab, snap.text)
   for (const [ref, whole] of now) { tab.seen.text.set(ref, whole); tab.seen.map.set(ref, whole) }
   tab.read = { doc: tab.doc, text: snap.text }
-  return `${await header(tab)}  — the whole page${note ? `; ${note}` : ''}${settled ? `; settled: ${settled}` : ''}\n${blocked(tab, snap.tree)}\n${short}`
+  return `${await header(tab)}  — it opened what is below${settled ? `, settled: ${settled}` : ''}\n\n${short}`
 }
 
 // The page's text, or one region's, as the agent reads it.
@@ -433,7 +451,7 @@ function changedCollections(snap: Awaited<ReturnType<typeof snapshot>>, added: s
 async function changes(tab: Tab, settled = ''): Promise<string> {
   const snap = await snapshot(tab)
   const before = tab.shown.get(contextOf(snap.text))
-  if (!before || before.doc !== tab.doc) return pageView(tab, snap, settled)
+  if (!before || before.doc !== tab.doc) return contextOf(snap.text) === 'page' ? mapView(tab, snap, settled) : openedView(tab, snap, settled)
   const { removed, added } = diffLines(before.text.split('\n'), snap.text.split('\n'))
   const size = [...removed, ...added].reduce((n, l) => n + l.length + 3, 0)
   // Changed lines longer than the page itself: the page was replaced. Like a new view, it is answered
@@ -555,7 +573,13 @@ async function act(tab: Tab, ref: string | undefined, fn: (t: Target) => Promise
       const gone = GONE.test(msg) || /is not on the page —/.test(msg)
       if (gone && attempt === 0 && /^\d+$/.test(ref ?? '')) { await snapshot(tab); continue }
       if (/is not on the page —|is in a frame that is gone|expected a ref number/.test(msg)) throw err
-      throw new Error(GONE.test(msg) ? `[${ref}] is not on the page any more (it changed) — run: browser-layer map` : `cannot act on [${ref}]: ${msg}${/its controls: /.test(msg) ? ' (click one by name, then this again)' : ''}`)
+      if (GONE.test(msg)) throw new Error(`[${ref}] is not on the page any more (it changed) — run: browser-layer map`)
+      // A number is a ref, so "15" meant as a day or a page number acts on ref 15; when that one cannot be
+      // reached, the controls named with that number (a day "March 15th", a page "15") are listed instead.
+      const number = new RegExp(`(^|[^\\d.,])${ref}(st|nd|rd|th)?($|[^\\d.,])`)
+      const shown = /^\d+$/.test(ref ?? '') ? withRefs((await snapshot(tab)).tree).filter(n => String(n.ref) !== ref && number.test(n.name ?? '')) : []
+      const meant = shown.length ? `; controls named with ${ref}: ${shown.slice(0, policy['render.mapFew']).map(n => `[${n.ref}] ${n.role} "${n.name}"`).join(' · ')}` : ''
+      throw new Error(`cannot act on [${ref}]: ${msg}${/its controls: /.test(msg) ? ' (click one by name, then this again)' : ''}${meant}`)
     }
   }
 }
@@ -620,16 +644,16 @@ async function newTab(session: string, url: string): Promise<Tab> {
 
 // tab <url>: a page already open in this session is switched to, as a browser's "switch to tab" does (no
 // second copy to load and keep track of); any other opens in a new tab, which becomes current.
-async function openTab(session: string, url: string): Promise<{ tab: Tab; text: string }> {
+async function openTab(session: string, url: string): Promise<string> {
   const open = [...tabs.values()].find(t => t.session === session && pageOf(t.page.url()) === pageOf(new URL(withUrl(url)).href))
   if (open) {
     open.used = Date.now()
     current.set(session, open.id)
-    return { tab: open, text: await mapView(open, undefined, '', 'already open here, so this is that tab (reload loads it again)', true) }
+    return mapView(open, undefined, '', 'already open here, so this is that tab (reload loads it again)', true)
   }
   const tab = await newTab(session, url)
   const note = await arrive(tab)
-  return { tab, text: await pageView(tab, undefined, unusual(await settle(tab)), note) }
+  return mapView(tab, undefined, unusual(await settle(tab)), note)
 }
 
 // What an action did: a dialog waiting, a pop-up that opened (it becomes current, answered with its
@@ -646,7 +670,7 @@ async function answer(tab: Tab): Promise<string> {
   const popup = tabs.get(tab.opened.splice(0).pop() ?? 0)
   if (popup) {
     await settle(popup)
-    return [...notes, `opened tab ${popup.id} (a pop-up of tab ${tab.id}); it is now current`, '', await pageView(popup)].join('\n')
+    return [...notes, `opened tab ${popup.id} (a pop-up of tab ${tab.id}); it is now current`, '', await mapView(popup)].join('\n')
   }
   const body = await changes(tab, settled)
   return notes.length ? `${notes.join('\n')}\n${body}` : body
@@ -724,23 +748,15 @@ async function run(c: Command): Promise<string> {
     c.to = await refNamed(tab, c.to)
   }
   switch (c.cmd) {
-    case 'tab': {
-      const urls = [c.url ?? 'about:blank', ...(c.more ?? [])]
-      if (urls.length === 1) return (await openTab(c.session, urls[0])).text
-      // Several pages load side by side, as a person opens links in new tabs, and each answers as if opened
-      // alone; one that fails says so without stopping the others. The last one given is current.
-      const opened = await Promise.all(urls.map(u => openTab(c.session, u).catch(err => ({ tab: undefined, text: `${u}  — error: ${err instanceof Error ? err.message.split('\n')[0] : err}` }))))
-      const last = opened.map(o => o.tab).filter(t => t !== undefined).pop()
-      if (last) current.set(c.session, last.id)
-      return opened.map(o => o.text).join('\n\n')
-    }
+    case 'tab':
+      return openTab(c.session, c.url ?? 'about:blank')
     case 'go': {
       const tab = need(c.session)
       // A page can ask before it is left (beforeunload): that dialog waits for the agent like any other.
       await untilDialog(tab, tab.page.goto(withUrl(c.url!), COMMIT()))
       if (tab.dialog) return answer(tab)
       const note = await arrive(tab)
-      return pageView(tab, undefined, unusual(await settle(tab)), note)
+      return mapView(tab, undefined, unusual(await settle(tab)), note)
     }
     case 'back':
     case 'forward':
@@ -749,7 +765,7 @@ async function run(c: Command): Promise<string> {
       await untilDialog(tab, c.cmd === 'back' ? tab.page.goBack(COMMIT()) : c.cmd === 'forward' ? tab.page.goForward(COMMIT()) : tab.page.reload(COMMIT()))
       if (tab.dialog) return answer(tab)
       const note = await arrive(tab)
-      return pageView(tab, undefined, unusual(await settle(tab)), note)
+      return mapView(tab, undefined, unusual(await settle(tab)), note)
     }
     case 'steps': {
       // Several commands in one call, run in order as if sent one by one. A read answers in full, an action

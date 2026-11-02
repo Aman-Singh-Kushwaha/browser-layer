@@ -74,8 +74,9 @@ const CHECKS = /^https:\/\/(www\.google\.com\/recaptcha|www\.recaptcha\.net|[\w.
 // A human check stands in front of the page when its frame is on a page with almost nothing else to act
 // on (a challenge page). On a page full of controls it guards one form (sign-up, contact), and the page
 // itself is readable.
+// An invisible check (size=invisible: a badge, no challenge) only scores the visitor; it stops no one.
 export const humanCheck = (frameUrls: string[], tree: Node, fewest: number) =>
-  frameUrls.some(u => CHECKS.test(u)) && withRefs(tree).length < fewest
+  frameUrls.some(u => CHECKS.test(u) && !/[?&]size=invisible\b/.test(u)) && withRefs(tree).length < fewest
 // WAI-ARIA: a control that declares it opens something (aria-haspopup, or aria-expanded=false) and is
 // enabled. Comboboxes open value lists (fonts, sizes), not commands, so they are left out.
 const OPENERS = new Set(['button', 'menuitem', 'link', 'tab'])
@@ -284,7 +285,11 @@ export async function readTree(cdp: CDPSession, refs: Refs, limits: Limits, fram
     if (str(nodeName[i]).startsWith('::')) return l === undefined || hidden ? [] : [{ key, children: [{ text: str(doc.layout.text[l]) }] }]
 
     const block = l !== undefined && display !== undefined && !INLINE_DISPLAY.test(display)
-    if (WIDGETS.has(role) && l !== undefined && visibility !== 'hidden') {
+    // A grid cell labelled apart from what it shows ("Choose Sunday, March 15th" on a "15") is one a user
+    // picks, as a date picker's days are; a data grid's cells are named by their content and stay content.
+    const label = role === 'gridcell' ? squash(String(a?.name?.value ?? '')) : ''
+    const pickable = label !== '' && !content(textOf(children)).includes(content(label))
+    if ((WIDGETS.has(role) || pickable) && l !== undefined && visibility !== 'hidden') {
       const { states, url, popup } = statesOf(a!)
       if (hovered.has(backendNodeId[i]) || HOVER_ATTRS.some(h => attr(i, h) !== undefined)) states.push('reacts to hover')
       const value = a!.value?.value

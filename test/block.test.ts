@@ -16,3 +16,7 @@ test('a check frame guarding one form on a full page is not a block', () => {
 test('no check frame, no human check', () => {
   assert.equal(humanCheck(['https://shop.example/'], page(2), 30), false)
 })
+
+test('an invisible check (a badge that only scores the visitor) is not a block', () => {
+  assert.equal(humanCheck(['https://www.google.com/recaptcha/api2/anchor?k=x&size=invisible'], page(3), 30), false)
+})

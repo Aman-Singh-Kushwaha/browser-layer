@@ -24,7 +24,7 @@ const BLOCKER = `function (x, y) {
   const names = [...box.querySelectorAll('button, [role=button], a[href], input[type=submit], input[type=button]')]
     .map(b => (b.getAttribute('aria-label') || b.innerText || b.value || '').trim().replace(/\\s+/g, ' ')).filter(n => n && n.length <= 40)
   const controls = [...new Set(names)].slice(0, 6).map(n => '"' + n + '"').join(' · ')
-  return 'covered by <' + top.tagName.toLowerCase() + '>' + (what ? ' "' + what.trim().slice(0, 40) + '"' : '') + (controls ? '; its controls: ' + controls : '')
+  return 'covered by <' + top.tagName.toLowerCase() + '>' + (what ? ' "' + what.trim().replace(/\\s+/g, ' ').slice(0, 40) + '"' : '') + (controls ? '; its controls: ' + controls : '')
 }`
 const DISABLED = `function () { return !!this.disabled || this.getAttribute('aria-disabled') === 'true' }`
 const SELECT_CONTENTS = `function () {
