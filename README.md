@@ -65,6 +65,13 @@ forms are in the HTML the server sends; pages built by JavaScript need a live ta
 **Signing in**: `browser-layer login <url>` opens a normal browser window on the agent's profile. You
 sign in yourself (passwords, 2FA and passkeys stay with you), close it, and the agent stays signed in.
 
+**Your own Chrome**: to use the browser you are already signed in with, run `browser-layer attach`. It opens
+Chrome's `chrome://inspect/#remote-debugging` page, where you tick the box, and connects once; Chrome asks you to
+click Allow. Then run commands with `--attach auto` (or `BROWSER_LAYER_ATTACH=auto`; `--attach <port>` for a Chrome
+started with `--remote-debugging-port`). The agent works only in tabs of its own, never touches yours, keeps the one
+connection (one Allow) until you `stop` it, and leaves Chrome running. It acts as you on every site you are signed
+in to, so use it only when you want that.
+
 **Watching**: `browser-layer show` turns the agent's browser into a visible window; `browser-layer hide`
 makes it headless again. `browser-layer screenshot [ref]` saves a picture of the tab or one region
 when a person wants one.

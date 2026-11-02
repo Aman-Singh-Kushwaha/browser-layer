@@ -1,6 +1,7 @@
 // Which browser the agent drives: the first Chromium-family browser found, the same one for the
 // daemon and for `login`, so both read and write the same profile. BROWSER_LAYER_BROWSER overrides.
-import { existsSync } from 'node:fs'
+import { spawnSync } from 'node:child_process'
+import { existsSync, readFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { delimiter, join } from 'node:path'
 
@@ -36,3 +37,23 @@ export async function findBrowser(): Promise<{ path: string } | { error: string 
 // Chromium will not start as root on Linux with its sandbox on (containers, root shells); Playwright
 // turns it off for the agent's browser, and a window `login` opens as root needs the same.
 export const PROFILE_FLAGS = ['--password-store=basic', '--use-mock-keychain', ...(process.getuid?.() === 0 ? ['--no-sandbox'] : [])]
+
+/** The address of the Chrome a person has open with remote debugging switched on (chrome://inspect/#remote-debugging):
+ * Chrome writes it to DevToolsActivePort in its profile directory. */
+export function openChrome(): string | undefined {
+  const dir = process.platform === 'darwin' ? join(homedir(), 'Library', 'Application Support', 'Google', 'Chrome')
+    : process.platform === 'win32' ? join(env('LOCALAPPDATA'), 'Google', 'Chrome', 'User Data') : join(homedir(), '.config', 'google-chrome')
+  try {
+    const [port, path] = readFileSync(join(dir, 'DevToolsActivePort'), 'utf8').split('\n')
+    return `ws://127.0.0.1:${port}${path}`
+  } catch {
+    return undefined
+  }
+}
+
+/** Show the person Chrome's page for switching remote debugging on. False where this cannot be done from here. */
+export function openInspectPage(): boolean {
+  if (process.platform !== 'darwin') return false
+  const url = 'chrome://inspect/#remote-debugging'
+  return spawnSync('osascript', ['-e', 'tell application "Google Chrome" to activate', '-e', `tell application "Google Chrome" to open location "${url}"`]).status === 0
+}

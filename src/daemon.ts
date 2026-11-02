@@ -3,7 +3,7 @@
 import { createServer } from 'node:http'
 import { chmodSync, existsSync, mkdirSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
-import { chromium, type BrowserContext, type CDPSession, type Dialog, type Page, type Request } from 'playwright-core'
+import { chromium, type Browser, type BrowserContext, type CDPSession, type Dialog, type Page, type Request, type Route } from 'playwright-core'
 import { isTracker } from './trackers.js'
 import { findBrowser } from './browser.js'
 import { home, loadJar, saveJar, type Cookie } from './session.js'
@@ -11,11 +11,16 @@ import { COLLECTIONS, LANDMARKS, humanCheck, isTrigger, newRefs, readTree, withR
 import { diffLines, findRef, itemsLine, paginate, renderMap, renderText } from './render.js'
 import { call, drag, fill, heldBy, isChecked, isFileInput, pick, pointer, setFiles, submit, wheel, type Pointer, type Target } from './act.js'
 import { query, records, toTsv, type Query } from './data.js'
-import { ping, socketPath, VERSION } from './client.js'
+import { pidPath, ping, socketPath, VERSION } from './client.js'
 import { loadPolicy, type Policy } from './policy.js'
 
 // Decoration the agent never needs; DESIGN §1 principle 3. Never requested.
 const DECORATION = new Set(['image', 'font', 'media'])
+
+// BROWSER_LAYER_ATTACH is the debugging address of a person's own Chrome. Attached, the daemon works only in tabs it
+// opened: it never closes the browser or the person's tabs, copies none of its cookies to disk, and changes no
+// setting that reaches their other tabs.
+const ATTACH = process.env.BROWSER_LAYER_ATTACH
 // Sites the agent let load decoration (`allow images`), by the origin of the page they are on.
 const pictured = new Set<string>()
 const siteOf = (r: Request) => { try { return new URL(r.frame().page().url()).origin } catch { return '' } }
@@ -160,6 +165,7 @@ const tabs = new Map<number, Tab>()
 const current = new Map<string, number>()
 let nextId = 1
 let ctx: BrowserContext
+let browser: Browser | undefined
 let policy: Policy
 
 function toBrowser(c: Cookie) {
@@ -168,12 +174,14 @@ function toBrowser(c: Cookie) {
 
 // Before each command: whatever the fast path logged into since, the browser gets too.
 async function pullCookies() {
+  if (ATTACH) return
   const jar = loadJar().filter(c => !c.expires || c.expires > Date.now())
   if (jar.length) await ctx.addCookies(jar.map(toBrowser)).catch(() => {})
 }
 
 // After each command: the browser now holds the jar plus its own changes, so it is the whole truth.
 async function syncCookies() {
+  if (ATTACH) return
   const jar: Cookie[] = (await ctx.cookies()).map(c => ({
     name: c.name,
     value: c.value,
@@ -593,7 +601,15 @@ function withUrl(url: string) {
 // One ref counter for every tab: a ref names one element in the whole browser (reader Refs).
 const refCounter = { next: 1 }
 
+// Decoration is not loaded unless a site was allowed to show it.
+const skipDecoration = (r: Route) => (DECORATION.has(r.request().resourceType()) && !pictured.has(siteOf(r.request())) ? r.abort() : r.continue())
+
 async function setupTab(session: string, page: Page): Promise<Tab> {
+  // Attached, these reach this tab only; a launched browser has them for all its tabs (see main).
+  if (ATTACH) {
+    await page.route('**/*', skipDecoration)
+    await page.addInitScript(PAGE_HOOKS)
+  }
   const cdp = await ctx.newCDPSession(page)
   await cdp.send('Accessibility.enable')
   await cdp.send('Animation.enable')
@@ -887,11 +903,13 @@ async function run(c: Command): Promise<string> {
     }
     case 'cookies': {
       // Cookie values are credentials, so they are never shown; names, sites and expiry are.
+      // Attached, the browser holds a person's every site: only the current page's is the agent's to see or clear.
+      const site = ATTACH ? new URL(need(c.session).page.url()).hostname : c.url
       if (c.dir === 'clear') {
-        await ctx.clearCookies(c.url ? { domain: c.url } : undefined)
-        return `cleared cookies${c.url ? ` for ${c.url}` : ''}`
+        await ctx.clearCookies(site ? { domain: site } : undefined)
+        return `cleared cookies${site ? ` for ${site}` : ''}`
       }
-      const list = (await ctx.cookies()).filter(k => !c.url || k.domain.replace(/^\./, '').endsWith(c.url))
+      const list = (await ctx.cookies()).filter(k => !site || k.domain.replace(/^\./, '').endsWith(site))
       if (!list.length) return 'no cookies'
       return list.map(k => `${k.domain}  ${k.name}  ${k.path}  ${k.expires > 0 ? `until ${new Date(k.expires * 1000).toISOString().slice(0, 10)}` : 'session'}${k.httpOnly ? '  httpOnly' : ''}${k.secure ? '  secure' : ''}`).join('\n')
     }
@@ -1034,6 +1052,7 @@ async function run(c: Command): Promise<string> {
       // for content that is only pictures (a scanned book, a map, a video) or a page that will not work without.
       if (perms.includes('images')) pictured.add(origin)
       const granted = perms.filter(p => p !== 'images')
+      if (ATTACH && (granted.length || c.dir)) throw new Error("allow cannot change a person's own browser; only allow images")
       if (granted.length) await ctx.grantPermissions(granted, { origin })
       if (c.dir) {
         const [latitude, longitude] = c.dir.split(',').map(Number)
@@ -1125,6 +1144,13 @@ function limited(c: Command): Promise<string> {
 // A Unix socket is a file left behind on exit; a Windows named pipe goes away with its server.
 const dropSocket = () => { if (process.platform !== 'win32') rmSync(socketPath(), { force: true }) }
 
+// Attached, only the tabs the daemon opened close, and the person's Chrome keeps running.
+async function release() {
+  if (!browser) return ctx.close().catch(() => {})
+  await Promise.all([...tabs.values()].map(t => t.page.close().catch(() => {})))
+  await browser.close().catch(() => {})
+}
+
 async function main() {
   // A second daemon would steal the socket and orphan the first one's tabs.
   if (await ping()) {
@@ -1132,22 +1158,34 @@ async function main() {
     process.exit(0)
   }
   policy = loadPolicy()
-  const browser = await findBrowser()
-  if ('error' in browser) {
-    console.error(browser.error)
-    process.exit(1)
+  if (ATTACH) {
+    // Chrome asks the person to click Allow on every new connection, and a connection that gives up while the popup is
+    // open would only raise another: there is no deadline, and a daemon that is turned down exits.
+    console.log('connecting; Chrome may be asking the person to allow remote debugging')
+    browser = await chromium.connectOverCDP(ATTACH, { timeout: 0 }).catch(err => {
+      console.error(`cannot attach to ${ATTACH}: ${err.message.split('\n')[0]}`)
+      return process.exit(1)
+    })
+    ctx = browser.contexts()[0]
+    rmSync(pidPath(), { force: true }) // connected: the pid file's job, telling the CLI a daemon is still waiting for Allow, is over
+  } else {
+    const found = await findBrowser()
+    if ('error' in found) {
+      console.error(found.error)
+      process.exit(1)
+    }
+    ctx = await chromium.launchPersistentContext(join(home(), 'profile'), {
+      executablePath: found.path,
+      // Headless always, except a browser `browser-layer show` started for a person to watch. Nothing is
+      // remembered: the next browser after this one is headless again.
+      headless: process.env.BROWSER_LAYER_VISIBLE !== '1',
+      viewport: { width: policy['viewport.width'], height: policy['viewport.height'] },
+      reducedMotion: 'reduce',
+    })
+    await ctx.route('**/*', skipDecoration)
+    await ctx.addInitScript(PAGE_HOOKS)
+    for (const p of ctx.pages()) await p.close()
   }
-  ctx = await chromium.launchPersistentContext(join(home(), 'profile'), {
-    executablePath: browser.path,
-    // Headless always, except a browser `browser-layer show` started for a person to watch. Nothing is
-    // remembered: the next browser after this one is headless again.
-    headless: process.env.BROWSER_LAYER_VISIBLE !== '1',
-    viewport: { width: policy['viewport.width'], height: policy['viewport.height'] },
-    reducedMotion: 'reduce',
-  })
-  await ctx.route('**/*', r => (DECORATION.has(r.request().resourceType()) && !pictured.has(siteOf(r.request())) ? r.abort() : r.continue()))
-  await ctx.addInitScript(PAGE_HOOKS)
-  for (const p of ctx.pages()) await p.close()
   // A page a site opens (window.open, target=_blank, an OAuth pop-up) joins its opener's session.
   ctx.on('page', async page => {
     const opener = await page.opener()
@@ -1164,12 +1202,13 @@ async function main() {
   const shutdown = async (reply?: (text: string) => void) => {
     stopping = true
     server.close()
-    await ctx.close().catch(() => {})
+    await release()
     dropSocket()
     if (reply) reply('stopped')
     else process.exit(0)
   }
-  const touch = () => { clearTimeout(idle); idle = setTimeout(() => void shutdown(), policy['daemon.idleMs']) }
+  // Attached, the one connection (and the one popup it cost the person) stays until Chrome goes or `stop`.
+  const touch = () => { clearTimeout(idle); if (!ATTACH) idle = setTimeout(() => void shutdown(), policy['daemon.idleMs']) }
   // The browser went away on its own (a person closed the visible window, Chrome crashed): a daemon
   // without a browser can only fail, so it exits and the next command starts a fresh one.
   ctx.on('close', () => {
@@ -1211,7 +1250,7 @@ async function main() {
   dropSocket()
   server.on('error', async err => {
     console.error(`cannot listen on ${socketPath()}: ${err.message}`)
-    await ctx.close().catch(() => {})
+    await release()
     process.exit(1)
   })
   server.listen(socketPath(), () => {

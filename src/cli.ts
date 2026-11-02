@@ -8,7 +8,7 @@ import { home, lastPage, request, saveLastPage, type Response, type Saved } from
 import { paginate, renderText } from './render.js'
 import { loadPolicy } from './policy.js'
 import { live, VERSION } from './client.js'
-import { findBrowser, PROFILE_FLAGS } from './browser.js'
+import { findBrowser, openChrome, openInspectPage, PROFILE_FLAGS } from './browser.js'
 import type { Command } from './daemon.js'
 
 const HELP = `browser-layer — websites as text and verbs for agents. <ref> is a number from the map, or a control's name.
@@ -37,6 +37,7 @@ Pop-ups open as tabs and become current; downloads are saved and reported.
 
 show / hide: watch the browser in a window. login <url>: a person signs in; the agent stays signed in.
 --session <name> (BROWSER_LAYER_SESSION): an agent's own tabs, cookies shared. --profile <name>: a separate browser.
+attach: set up your own Chrome for the agent. --attach <port|auto> (BROWSER_LAYER_ATTACH): work in it, in tabs of its own; it never closes yours.
 BROWSER_LAYER_BROWSER=<path> picks the browser.
 install · browser · update · --version`
 
@@ -168,9 +169,10 @@ function parse(words: string[]) {
   const file = out === undefined ? undefined : resolve(out)
   const session = take('--session')
   const profile = take('--profile')
+  const attach = take('--attach')
   const has = (flag: string) => argv.includes(flag)
   const [cmd, target, ...rest] = argv.filter(a => !FLAGS.has(a))
-  return { cmd, target, rest, page, limit, sort, cols, file, session, profile, has }
+  return { cmd, target, rest, page, limit, sort, cols, file, session, profile, attach, has }
 }
 
 // steps: commands separated by ; or a new line, each read as words the way a shell reads them ('…' and
@@ -246,6 +248,16 @@ async function main() {
     if (!/^[\w.-]+$/.test(parsed.profile)) fail('a profile name uses letters, digits, dot, dash or underscore')
     process.env.BROWSER_LAYER_HOME = join(home(), 'profiles', parsed.profile)
   }
+  // Attached to a person's own Chrome, which was started with a debugging port: its own daemon and home, so it never
+  // meets the browser of this agent's profile.
+  // `auto` is the Chrome that has remote debugging on; otherwise a port or an address.
+  const useChrome = (where: string) => {
+    const address = where === 'auto' ? openChrome() ?? fail('no Chrome with remote debugging on: run browser-layer attach') : where
+    process.env.BROWSER_LAYER_ATTACH = /^\d+$/.test(address) ? `http://127.0.0.1:${address}` : address
+    if (!process.env.BROWSER_LAYER_HOME?.endsWith('attached')) process.env.BROWSER_LAYER_HOME = join(home(), 'attached')
+  }
+  const attach = parsed.attach ?? (process.env.BROWSER_LAYER_ATTACH || undefined)
+  if (attach !== undefined && cmd !== 'attach') useChrome(attach)
   const json = parsed.has('--json')
   const argv = process.argv.slice(2)
 
@@ -283,6 +295,21 @@ async function main() {
     return console.log(`Installed. The agent's browser: ${((await findBrowser()) as { path: string }).path}`)
   }
 
+  if (cmd === 'attach') {
+    // Switch the person's Chrome to accept the agent, then connect once: Chrome's Allow popup comes now, not mid-task.
+    if (!openChrome()) {
+      console.log('In Chrome, tick "Allow remote debugging for this browser instance" on chrome://inspect/#remote-debugging.')
+      if (!openInspectPage()) console.log('Open that page in Chrome yourself.')
+      for (let i = 0; i < 400 && !openChrome(); i++) await new Promise(r => setTimeout(r, 300))
+      if (!openChrome()) fail('Chrome did not turn remote debugging on in two minutes')
+    }
+    useChrome('auto')
+    const r = await live({ cmd: 'tabs', session })
+    if (!r.ok) fail(r.error ?? 'could not attach')
+    return console.log('Attached to your Chrome. Run commands with --attach auto, or set BROWSER_LAYER_ATTACH=auto.')
+  }
+
+  if ((cmd === 'show' || cmd === 'hide' || cmd === 'login') && process.env.BROWSER_LAYER_ATTACH) fail(`${cmd} is for the agent's own browser; attached, you already use your own Chrome`)
   if (cmd === 'show' || cmd === 'hide') {
     // Chrome cannot switch between headless and visible while running, so the browser restarts and every
     // open tab is reopened in its session (the current one last, so it stays current). Sign-ins live in

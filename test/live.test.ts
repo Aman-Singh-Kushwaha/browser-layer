@@ -1,6 +1,6 @@
 import { execFile, spawn } from 'node:child_process'
 import { createServer, request } from 'node:http'
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { after, before, test } from 'node:test'
@@ -1111,4 +1111,37 @@ test('a date picker\'s labelled days are controls to click by name; a data grid\
 test('results a page loads from another site\'s API as it arrives are waited for', async () => {
   // In one call, so nothing between the page's arrival and the look at it gives the API time it was not waited for.
   assert.match((await run('steps', `tab ${base}/listing; find "results:"`)).out, /results: slow data/)
+})
+
+test("attached to a person's own Chrome: it works in tabs of its own, leaves theirs, copies no cookies, and stop leaves the browser running", async () => {
+  const found = await findBrowser()
+  assert.ok(!('error' in found))
+  const profile = mkdtempSync(join(tmpdir(), 'own-'))
+  spawn(found.path, [`--user-data-dir=${profile}`, ...PROFILE_FLAGS, '--headless=new', '--remote-debugging-port=0', '--no-first-run', `${base}/theirs`], { stdio: 'ignore' }).unref()
+  try {
+    // Chrome writes the port it picked to DevToolsActivePort, in its profile directory.
+    let port = ''
+    for (let i = 0; i < 100 && !port; i++) {
+      await new Promise(r => setTimeout(r, 150))
+      port = existsSync(join(profile, 'DevToolsActivePort')) ? readFileSync(join(profile, 'DevToolsActivePort'), 'utf8').split('\n')[0] : ''
+    }
+    assert.ok(port, 'the browser never wrote its debugging port')
+    const mine = mkdtempSync(join(tmpdir(), 'at-'))
+    const attached = (...args: string[]) => runIn(mine, '--attach', port, ...args)
+    assert.match((await attached('tab', `${base}/longmenu`)).out, /"longmenu"/)
+    const tabs = (await attached('tabs')).out
+    assert.match(tabs, /\/longmenu/)
+    assert.doesNotMatch(tabs, /\/theirs/)
+    assert.match((await attached('allow', 'geolocation', '1,2')).out, /cannot change a person's own browser/)
+    assert.equal(existsSync(join(mine, 'attached', 'cookies.json')), false)
+    await attached('stop')
+    const open = (await (await fetch(`http://127.0.0.1:${port}/json`)).json() as { type: string; url: string }[]).filter(t => t.type === 'page').map(t => t.url)
+    assert.ok(open.some(u => u.endsWith('/theirs')), `their tab is gone: ${open}`)
+    assert.ok(!open.some(u => u.endsWith('/longmenu')), `the agent's tab was left behind: ${open}`)
+    rmSync(mine, { recursive: true, force: true })
+  } finally {
+    await killByArgument(profile)
+    await new Promise(r => setTimeout(r, 500))
+    rmSync(profile, { recursive: true, force: true, maxRetries: 5, retryDelay: 300 })
+  }
 })

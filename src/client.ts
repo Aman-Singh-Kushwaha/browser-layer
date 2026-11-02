@@ -2,7 +2,7 @@
 import { request } from 'node:http'
 import { spawn } from 'node:child_process'
 import { createRequire } from 'node:module'
-import { closeSync, mkdirSync, openSync, rmSync, statSync } from 'node:fs'
+import { closeSync, mkdirSync, openSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { createHash } from 'node:crypto'
 import { tmpdir } from 'node:os'
 import { extname, join } from 'node:path'
@@ -23,6 +23,19 @@ export const socketPath = () => {
 }
 const lockPath = () => join(home(), 'daemon.lock')
 const LOCK_STALE_MS = 30000
+// Attached, a daemon may sit for a long time on Chrome's "Allow remote debugging?" popup, before it has a socket.
+// Its pid file tells the next command to wait for it, not to start a second daemon and raise a second popup.
+export const pidPath = () => join(home(), 'daemon.pid')
+const ALLOW_WAIT_MS = 60000
+const pending = (): number | undefined => {
+  try {
+    const pid = Number(readFileSync(pidPath(), 'utf8'))
+    process.kill(pid, 0)
+    return pid
+  } catch {
+    return undefined
+  }
+}
 
 // The installed version: the CLI prints it, and a daemon started by another version (before an update)
 // will not run this one's commands.
@@ -62,13 +75,15 @@ function takeLock(): boolean {
   }
 }
 
-function startDaemon() {
+function startDaemon(): number | undefined {
   const self = fileURLToPath(import.meta.url)
   const entry = join(self, '..', `daemon${extname(self)}`)
   const log = openSync(join(home(), 'daemon.log'), 'a')
   // execArgv carries tsx's loader in dev and tests, and is empty for the built CLI.
   // windowsHide: a detached process on Windows would otherwise open a console window of its own.
-  spawn(process.execPath, [...process.execArgv, entry], { detached: true, windowsHide: true, stdio: ['ignore', log, log], env: process.env }).unref()
+  const child = spawn(process.execPath, [...process.execArgv, entry], { detached: true, windowsHide: true, stdio: ['ignore', log, log], env: process.env })
+  child.unref()
+  return child.pid
 }
 
 export async function live(c: Command): Promise<Reply> {
@@ -85,17 +100,39 @@ export async function live(c: Command): Promise<Reply> {
     if (code !== 'ENOENT' && code !== 'ECONNREFUSED' && code !== 'ECONNRESET') throw err
   }
   // Asking about or stopping a browser that is not running must not start one.
+  if (c.cmd === 'stop' && process.env.BROWSER_LAYER_ATTACH && pending()) {
+    process.kill(pending()!)
+    rmSync(pidPath(), { force: true })
+    return { ok: true, text: 'stopped' }
+  }
   if (c.cmd === 'stop' || c.cmd === 'state') return { ok: true, text: c.cmd === 'stop' ? 'daemon was not running' : '[]' }
   // Without a browser the daemon could only exit; say why now instead of waiting for it.
-  const browser = await findBrowser()
-  if ('error' in browser) return { ok: false, error: browser.error }
+  if (!process.env.BROWSER_LAYER_ATTACH) {
+    const browser = await findBrowser()
+    if ('error' in browser) return { ok: false, error: browser.error }
+  }
   mkdirSync(home(), { recursive: true })
-  const mine = takeLock()
-  if (mine) startDaemon()
+  const attached = !!process.env.BROWSER_LAYER_ATTACH
+  const waiting = attached && pending() !== undefined
+  const mine = !waiting && takeLock()
+  if (mine) {
+    const pid = startDaemon()
+    if (attached && pid) writeFileSync(pidPath(), String(pid))
+  }
+  const started = Date.now()
   try {
-    for (let i = 0; i < 150; i++) {
+    for (let i = 0; ; i++) {
       await new Promise(r => setTimeout(r, 150))
       if (await ping()) return send(c, wait)
+      if (!attached) {
+        if (i >= 149) break
+        continue
+      }
+      // The person has to click Allow in Chrome: say so once, give up waiting after a minute, and keep the daemon
+      // for the next command. A daemon that exited (Don't allow, Chrome closed) is no longer worth waiting for.
+      if (!pending()) break
+      if (i === 13) console.error('Chrome is asking "Allow remote debugging?": click Allow in Chrome.')
+      if (Date.now() - started > ALLOW_WAIT_MS) throw new Error('Chrome is still waiting for you to click Allow on "Allow remote debugging?"; click it, then run the command again')
     }
   } finally {
     if (mine) rmSync(lockPath(), { force: true })
