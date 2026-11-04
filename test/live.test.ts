@@ -151,6 +151,8 @@ const server = createServer((req, res) => {
     <script>setTimeout(() => r.classList.remove('off'), 900)</script>`)
   // A document whose end arrives late: what came first is still readable.
   if (req.url === '/slowdoc') { res.setHeader('content-type', 'text/html'); res.write('<title>slowdoc</title><p>first part</p>'); return void setTimeout(() => res.end('<p>last part</p>'), 4000) }
+  // An app that draws its page after the DOM has gone quiet: a timer, client-side rendering.
+  if (req.url === '/draws-late') return page('draws-late', `<script>setTimeout(() => { document.body.innerHTML = '<p>Drawn at last</p>' }, 2500)</script>`)
   // A banner over a control, with buttons that answer it.
   if (req.url === '/banner') return page('banner', `<button onclick="o.textContent = 'reached'">Behind</button><p id="o">not yet</p>
     <div id="b" style="position:fixed;inset:0;background:#fff"><p>We use cookies</p><button onclick="b.remove()">Reject all</button><button onclick="b.remove()">Accept all</button></div>`)
@@ -1037,6 +1039,12 @@ test('a document whose end is slow to arrive is read as far as it got', async ()
   const r = await run('tab', `${base}/slowdoc`)
   assert.match(r.out, /settled: still loading after 2 s/)
   assert.match((await run('read')).out, /first part/)
+})
+
+test('a page with nothing drawn yet says it may still be loading; a page with only a form does not', async () => {
+  const blank = await run('tab', `${base}/draws-late`)
+  assert.match(blank.out, /no content yet: the page may still be loading; read again/)
+  assert.doesNotMatch((await run('tab', `${base}/form2`)).out, /still be loading/)
 })
 
 test('steps runs several commands in one call: actions in one line, reads and the last in full', async () => {

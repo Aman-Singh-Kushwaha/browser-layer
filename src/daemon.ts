@@ -348,6 +348,7 @@ async function mapView(tab: Tab, snap?: Awaited<ReturnType<typeof snapshot>>, se
   const now = new Map<number, string>()
   const map = renderMap(tree, origin, caps(), policy['render.mapFew'], { before: whole ? new Map() : tab.seen.map, now })
   for (const [ref, whole] of now) tab.seen.map.set(ref, whole)
+  if (!map.trim()) note = [note, 'no content yet: the page may still be loading; read again'].filter(Boolean).join('; ')
   return `${await header(tab)}${note ? `  — ${note}` : ''}${settled ? `  — settled: ${settled}` : ''}\n${await blocked(tab, tree)}\n${map}\n\n(read <ref> opens a region · read gives the whole page)`
 }
 
